@@ -182,24 +182,42 @@ enum CanvasInstructionMapper {
         let w = Int(b.width.rounded())
         let h = Int(b.height.rounded())
 
-        // Derive fill colour from the node's fills (first visible solid paint, or "none").
-        let fillStr: String
-        if let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) {
-            let r = Int((color.r * 255).rounded())
-            let g = Int((color.g * 255).rounded())
+        // Derive fill colour: solid fill → solid stroke fallback → black default.
+        // VECTOR nodes often have no fill (styled via stroke or inherited colour);
+        // using black ensures the shape is always visible in the preview.
+        func rgbaStr(_ color: FigmaColor, _ paintOpacity: Double) -> String {
+            let r  = Int((color.r * 255).rounded())
+            let g  = Int((color.g * 255).rounded())
             let bv = Int((color.b * 255).rounded())
-            let a = String(format: "%.3f", color.alpha * paintOpacity * node.effectiveOpacity)
-            fillStr = "rgba(\(r),\(g),\(bv),\(a))"
+            let a  = String(format: "%.3f", color.alpha * paintOpacity * node.effectiveOpacity)
+            return "rgba(\(r),\(g),\(bv),\(a))"
+        }
+        let fillStr: String
+        var strokeStr = "none"
+        var strokeWidth = 0.0
+        if let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) {
+            fillStr = rgbaStr(color, paintOpacity)
+        } else if let (color, paintOpacity) = solidColorAndOpacity(from: node.strokes) {
+            // No fill but has a stroke — render as a filled shape using the stroke colour.
+            fillStr = rgbaStr(color, paintOpacity)
         } else {
-            fillStr = "none"
+            // No colour info at all — fall back to black so the shape is visible.
+            fillStr = "#000000"
+        }
+        // Also include stroke if both fill and stroke paints are present.
+        if fillStr != "none", let (sColor, sOpacity) = solidColorAndOpacity(from: node.strokes) {
+            strokeStr = rgbaStr(sColor, sOpacity)
+            strokeWidth = node.strokeWeight ?? 1.0
         }
 
-        // Build <path> elements. vectorPaths coordinates are in Figma canvas space,
-        // so translate by -x, -y to produce a 0-origin local SVG coordinate space.
+        // Build <path> elements. vectorPaths from the Plugin API are already in node-local
+        // coordinate space, so no translate transform is needed.
         var pathXml = ""
         for vp in paths {
             let rule = (vp.windingRule == "EVENODD") ? "evenodd" : "nonzero"
-            pathXml += "<path fill=\"\(fillStr)\" fill-rule=\"\(rule)\" d=\"\(vp.data)\" transform=\"translate(\(-b.x),\(-b.y))\"/>"
+            var attrs = "fill=\"\(fillStr)\" fill-rule=\"\(rule)\""
+            if strokeStr != "none" { attrs += " stroke=\"\(strokeStr)\" stroke-width=\"\(strokeWidth)\"" }
+            pathXml += "<path \(attrs) d=\"\(vp.data)\"/>"
         }
         let svgContent = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"\(w)\" height=\"\(h)\" viewBox=\"0 0 \(w) \(h)\">\(pathXml)</svg>"
 
