@@ -48,6 +48,7 @@ public enum CanvasCodeGen {
         var needsText             = false
         var fontFamilies: [String] = []   // ordered, deduplicated in insertion order
         var imageRefs:    [String] = []   // ordered, deduplicated image hashes
+        var svgIds:       [String] = []   // ordered, deduplicated SVG node IDs
         func scanItems(_ items: [CanvasItem]) {
             for item in items {
                 switch item {
@@ -71,6 +72,11 @@ public enum CanvasCodeGen {
                     needsRectangle = true
                     if !imageRefs.contains(img.imageRef) {
                         imageRefs.append(img.imageRef)
+                    }
+                case .svg(let svg):
+                    needsRectangle = true  // Svg extends Rectangle; Rectangle import is needed
+                    if !svgIds.contains(svg.svgId) {
+                        svgIds.append(svg.svgId)
                     }
                 }
             }
@@ -106,7 +112,7 @@ public enum CanvasCodeGen {
         // Collect all InstructionGroup subclasses in post-order (leafs emitted first).
         let groups = allGroupsPostOrder(frames: frames)
 
-        // Assemble module body: imports → font/image registration → group classes → frame Widget classes.
+        // Assemble module body: imports → font/image/svg registration → group classes → frame Widget classes.
         var body: [Statement] = needsText ? [importWidget, importGraphics, importCoreLabel]
                                           : [importWidget, importGraphics]
         if !fontFamilies.isEmpty {
@@ -114,6 +120,10 @@ public enum CanvasCodeGen {
         }
         if !imageRefs.isEmpty {
             body.append(contentsOf: imageRegistrationStmts(refs: imageRefs))
+        }
+        if !svgIds.isEmpty {
+            body.append(contentsOf: svgRegistrationStmts(ids: svgIds))
+            body.append(contentsOf: svgClassStmts())
         }
         for group in groups {
             body.append(.blank())
@@ -557,6 +567,35 @@ public enum CanvasCodeGen {
                     CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
                                   r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil)
                 )))
+            case .svg(let svg):
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(1.0), floatConst(1.0), floatConst(1.0), floatConst(svg.opacity)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(colorRef))
+                lastR = 1.0; lastG = 1.0; lastB = 1.0; lastA = svg.opacity
+
+                let svgAttrName = "svg_\(counter)"
+                counter += 1
+                let svgRef = attrExpr(nameExpr("self"), svgAttrName)
+                let svgConstName = CanvasCodeGen.svgConstName(svg.svgId)
+                stmts.append(.assign(Assign(
+                    targets: [svgRef],
+                    value: callExpr(fun: nameExpr("Svg"), args: [
+                        intConst(svg.x), intConst(svg.y),
+                        intConst(svg.width), intConst(svg.height),
+                        nameExpr(svgConstName)
+                    ], keywords: []),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(svgRef))
             }
         }
         return stmts
@@ -747,6 +786,35 @@ public enum CanvasCodeGen {
                     CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
                                   r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil)
                 )))
+            case .svg(let svg):
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(1.0), floatConst(1.0), floatConst(1.0), floatConst(svg.opacity)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(colorRef))
+                lastR = 1.0; lastG = 1.0; lastB = 1.0; lastA = svg.opacity
+
+                let svgAttrName = "svg_\(counter)"
+                counter += 1
+                let svgRef = attrExpr(nameExpr("self"), svgAttrName)
+                let svgConstName = CanvasCodeGen.svgConstName(svg.svgId)
+                stmts.append(.assign(Assign(
+                    targets: [svgRef],
+                    value: callExpr(fun: nameExpr("Svg"), args: [
+                        intConst(svg.x), intConst(svg.y),
+                        intConst(svg.width), intConst(svg.height),
+                        nameExpr(svgConstName)
+                    ], keywords: []),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(svgRef))
             }
         }
         return stmts
@@ -1056,6 +1124,243 @@ public enum CanvasCodeGen {
         return stmts
     }
 
+    /// Converts a Figma node ID to a Python module-level constant name.
+    /// e.g. "0:123" → "SVG_0_123"
+    static func svgConstName(_ svgId: String) -> String {
+        let safe = svgId
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        return "SVG_\(safe.uppercased())"
+    }
+
+    /// Percent-encodes a Figma node ID for use in a URL path (e.g. "0:123" → "0%3A123").
+    private static func svgIdUrlPath(_ svgId: String) -> String {
+        svgId.replacingOccurrences(of: ":", with: "%3A")
+    }
+
+    /// Emits module-level statements that download each SVG from FIGMA_SERVER_URL
+    /// into a temp file and bind a constant to its path, e.g.:
+    ///   SVG_0_123 = _os.path.join(_tempfile.gettempdir(), "svgs", "SVG_0_123.svg")
+    ///   if not _os.path.exists(SVG_0_123):
+    ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/svg/0%3A123", SVG_0_123)
+    private static func svgRegistrationStmts(ids: [String]) -> [Statement] {
+        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
+        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",             asName: "_os")]))
+        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",       asName: "_tempfile")]))
+
+        // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "svgs"), exist_ok=True)
+        let svgsDirExpr = callExpr(
+            fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+            args: [
+                callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                strConst("svgs")
+            ],
+            keywords: []
+        )
+        let makedirs = exprStmt(callExpr(
+            fun: attrExpr(nameExpr("_os"), "makedirs"),
+            args: [svgsDirExpr],
+            keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
+        ))
+
+        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+
+        for svgId in ids {
+            let constName    = svgConstName(svgId)
+            let fileBasename = constName.lowercased() + ".svg"
+            let idEncoded    = svgIdUrlPath(svgId)
+
+            // SVG_0_123 = _os.path.join(_tempfile.gettempdir(), "svgs", "svg_0_123.svg")
+            let constAssign = Statement.assign(Assign(
+                targets: [.name(Name(id: constName, ctx: .store))],
+                value: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+                    args: [
+                        callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                        strConst("svgs"),
+                        strConst(fileBasename)
+                    ],
+                    keywords: []
+                ),
+                typeComment: nil
+            ))
+
+            // _os.environ["FIGMA_SERVER_URL"] + "/svg/0%3A123"
+            let serverUrl = Expression.subscriptExpr(Subscript(
+                value: attrExpr(nameExpr("_os"), "environ"),
+                slice: strConst("FIGMA_SERVER_URL")
+            ))
+            let downloadUrl = Expression.binOp(BinOp(
+                left: serverUrl, op: .add, right: strConst("/svg/\(idEncoded)")
+            ))
+
+            let urlretrieve = exprStmt(callExpr(
+                fun: attrExpr(nameExpr("_urllib_request"), "urlretrieve"),
+                args: [downloadUrl, nameExpr(constName)],
+                keywords: []
+            ))
+
+            let ifNotExists = Statement.ifStmt(If(
+                test: Expression.unaryOp(UnaryOp(op: .not, operand: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "exists"),
+                    args: [nameExpr(constName)], keywords: []
+                ))),
+                body: [urlretrieve],
+                orElse: []
+            ))
+
+            stmts.append(.blank())
+            stmts.append(constAssign)
+            stmts.append(ifNotExists)
+        }
+        return stmts
+    }
+
+    /// Emits the inline `Svg` class definition (requires `thorvg-cython` in the environment).
+    /// This mirrors `svg_instructions.py` so the generated module is self-contained.
+    private static func svgClassStmts() -> [Statement] {
+        // Imports for the Svg class
+        let importTexture = Statement.importFrom(ImportFrom(
+            module: "kivy.graphics.texture",
+            names: [Alias(name: "Texture", asName: "_Texture")],
+            level: 0
+        ))
+        let importSwCanvas = Statement.importFrom(ImportFrom(
+            module: "thorvg_cython.sw_canvas",
+            names: [Alias(name: "SwCanvas", asName: "_SwCanvas")],
+            level: 0
+        ))
+        let importPicture = Statement.importFrom(ImportFrom(
+            module: "thorvg_cython.thorvg",
+            names: [Alias(name: "Picture", asName: "_Picture")],
+            level: 0
+        ))
+
+        // __init__ body
+        // tex = _Texture.create(size=(width, height), colorfmt='rgba')
+        let texAssign = Statement.assign(Assign(
+            targets: [.name(Name(id: "tex", ctx: .store))],
+            value: callExpr(
+                fun: attrExpr(nameExpr("_Texture"), "create"),
+                args: [],
+                keywords: [
+                    Keyword(arg: "size", value: .tuple(Tuple(elts: [nameExpr("width"), nameExpr("height")]))),
+                    Keyword(arg: "colorfmt", value: strConst("rgba"))
+                ]
+            ),
+            typeComment: nil
+        ))
+        // swc = _SwCanvas(width, height)
+        let swcAssign = Statement.assign(Assign(
+            targets: [.name(Name(id: "swc", ctx: .store))],
+            value: callExpr(fun: nameExpr("_SwCanvas"), args: [nameExpr("width"), nameExpr("height")], keywords: []),
+            typeComment: nil
+        ))
+        // pic = _Picture()
+        let picAssign = Statement.assign(Assign(
+            targets: [.name(Name(id: "pic", ctx: .store))],
+            value: callExpr(fun: nameExpr("_Picture"), args: [], keywords: []),
+            typeComment: nil
+        ))
+        // pic.load(path)
+        let picLoad = exprStmt(callExpr(fun: attrExpr(nameExpr("pic"), "load"), args: [nameExpr("path")], keywords: []))
+        // pic.set_size(width, height)
+        let picSetSize = exprStmt(callExpr(fun: attrExpr(nameExpr("pic"), "set_size"), args: [nameExpr("width"), nameExpr("height")], keywords: []))
+        // swc.add(pic)
+        let swcAdd = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "add"), args: [nameExpr("pic")], keywords: []))
+        // swc.sync()
+        let swcSync = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "sync"), args: [], keywords: []))
+        // swc.draw()
+        let swcDraw = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "draw"), args: [], keywords: []))
+        // tex.blit_buffer(swc, colorfmt='rgba', bufferfmt='ubyte')
+        let blitBuf = exprStmt(callExpr(
+            fun: attrExpr(nameExpr("tex"), "blit_buffer"),
+            args: [nameExpr("swc")],
+            keywords: [
+                Keyword(arg: "colorfmt",  value: strConst("rgba")),
+                Keyword(arg: "bufferfmt", value: strConst("ubyte"))
+            ]
+        ))
+        // self.swc = swc
+        let selfSwc = Statement.assign(Assign(targets: [attrExpr(nameExpr("self"), "swc")], value: nameExpr("swc"), typeComment: nil))
+        // self.pic = pic
+        let selfPic = Statement.assign(Assign(targets: [attrExpr(nameExpr("self"), "pic")], value: nameExpr("pic"), typeComment: nil))
+        // super().__init__(texture=tex, size=(width, height), pos=(x, y))
+        let superInit = exprStmt(callExpr(
+            fun: attrExpr(callExpr(fun: nameExpr("super"), args: [], keywords: []), "__init__"),
+            args: [],
+            keywords: [
+                Keyword(arg: "texture", value: nameExpr("tex")),
+                Keyword(arg: "size",    value: .tuple(Tuple(elts: [nameExpr("width"), nameExpr("height")]))),
+                Keyword(arg: "pos",     value: .tuple(Tuple(elts: [nameExpr("x"), nameExpr("y")])))
+            ]
+        ))
+
+        let initFunc = Statement.functionDef(FunctionDef(
+            name: "__init__",
+            args: Arguments(args: [
+                Arg(arg: "self"), Arg(arg: "x"), Arg(arg: "y"),
+                Arg(arg: "width"), Arg(arg: "height"), Arg(arg: "path")
+            ], kwarg: nil),
+            body: [texAssign, swcAssign, picAssign, picLoad, picSetSize, swcAdd, swcSync, swcDraw, blitBuf, selfSwc, selfPic, superInit]
+        ))
+
+        // resize method body
+        // swc = self.swc
+        let rSwcAssign = Statement.assign(Assign(targets: [.name(Name(id: "swc", ctx: .store))], value: attrExpr(nameExpr("self"), "swc"), typeComment: nil))
+        // tex = _Texture.create(size=(width, height), colorfmt='rgba')
+        let rTexAssign = Statement.assign(Assign(
+            targets: [.name(Name(id: "tex", ctx: .store))],
+            value: callExpr(
+                fun: attrExpr(nameExpr("_Texture"), "create"),
+                args: [],
+                keywords: [
+                    Keyword(arg: "size",     value: .tuple(Tuple(elts: [nameExpr("width"), nameExpr("height")]))),
+                    Keyword(arg: "colorfmt", value: strConst("rgba"))
+                ]
+            ),
+            typeComment: nil
+        ))
+        // swc.resize(width, height)
+        let rSwcResize = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "resize"), args: [nameExpr("width"), nameExpr("height")], keywords: []))
+        // swc.sync()
+        let rSwcSync = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "sync"), args: [], keywords: []))
+        // swc.draw()
+        let rSwcDraw = exprStmt(callExpr(fun: attrExpr(nameExpr("swc"), "draw"), args: [], keywords: []))
+        // tex.blit_buffer(swc, colorfmt='rgba', bufferfmt='ubyte')
+        let rBlitBuf = exprStmt(callExpr(
+            fun: attrExpr(nameExpr("tex"), "blit_buffer"),
+            args: [nameExpr("swc")],
+            keywords: [
+                Keyword(arg: "colorfmt",  value: strConst("rgba")),
+                Keyword(arg: "bufferfmt", value: strConst("ubyte"))
+            ]
+        ))
+        // self.texture = tex
+        let rSelfTex = Statement.assign(Assign(targets: [attrExpr(nameExpr("self"), "texture")], value: nameExpr("tex"), typeComment: nil))
+        // self.size = (width, height)
+        let rSelfSize = Statement.assign(Assign(
+            targets: [attrExpr(nameExpr("self"), "size")],
+            value: .tuple(Tuple(elts: [nameExpr("width"), nameExpr("height")])),
+            typeComment: nil
+        ))
+
+        let resizeFunc = Statement.functionDef(FunctionDef(
+            name: "resize",
+            args: Arguments(args: [Arg(arg: "self"), Arg(arg: "width"), Arg(arg: "height")], kwarg: nil),
+            body: [rSwcAssign, rTexAssign, rSwcResize, rSwcSync, rSwcDraw, rBlitBuf, rSelfTex, rSelfSize]
+        ))
+
+        let classDef = Statement.classDef(ClassDef(
+            name: "Svg",
+            bases: [nameExpr("Rectangle")],
+            body: [initFunc, .blank(), resizeFunc]
+        ))
+
+        return [.blank(), importTexture, importSwCanvas, importPicture, .blank(), .blank(), classDef]
+    }
+
     /// Emits module-level statements that download each font from FIGMA_SERVER_URL
     /// into a temp file and bind a constant to its path, e.g.:
     ///   COMIC_SANS_MS = _os.path.join(_tempfile.gettempdir(), "fonts", "Comic_Sans_MS.ttf")
@@ -1257,6 +1562,8 @@ public enum CanvasCodeGen {
                 case .image(let img):
                     needsR = true
                     if !imageRefs.contains(img.imageRef) { imageRefs.append(img.imageRef) }
+                case .svg:
+                    needsR = true  // Svg extends Rectangle; Rectangle import is needed
                 }
             }
         }

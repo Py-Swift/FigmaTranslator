@@ -1,15 +1,6 @@
 {
-  "originHash" : "54df447a847d35a29bccc178b95016621c8c76c0d197c75863d1e71faf9a0119",
+  "originHash" : "256fcbf642b3f1b121cee724867478e13d36556f4d5d08aa524e64a91345453e",
   "pins" : [
-    {
-      "identity" : "figmaapi",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/Py-Swift/FigmaApi.git",
-      "state" : {
-        "branch" : "master",
-        "revision" : "1fc8e40bafa0740b6f6b7b776fc826babdac38be"
-      }
-    },
     {
       "identity" : "pyswiftast",
       "kind" : "remoteSourceControl",

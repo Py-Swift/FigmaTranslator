@@ -98,14 +98,29 @@ public struct CanvasImageIR {
     public let opacity: Double
 }
 
+// MARK: - SVG IR
+
+/// Intermediate representation of a Figma VECTOR node exported as SVG.
+public struct CanvasSvgIR {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+    /// The Figma node ID used to fetch the SVG from FIGMA_SERVER_URL/svg/:id.
+    public let svgId: String
+    /// Node-level opacity.
+    public let opacity: Double
+}
+
 // MARK: - Item tree (shapes + nested groups)
 
-/// A canvas renderable: either a leaf shape, a nested InstructionGroup, a text label, or an image.
+/// A canvas renderable: either a leaf shape, a nested InstructionGroup, a text label, an image, or an SVG vector.
 public indirect enum CanvasItem {
     case shape(CanvasShapeIR)
     case group(CanvasGroupIR)
     case text(CanvasTextIR)
     case image(CanvasImageIR)
+    case svg(CanvasSvgIR)
 }
 
 /// A named Kivy `InstructionGroup` emitted as its own Python class.

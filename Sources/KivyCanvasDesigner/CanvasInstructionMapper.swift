@@ -116,10 +116,15 @@ enum CanvasInstructionMapper {
             }
             switch child.type {
             case .rectangle, .vector:
-                let radii = cornerRadii(for: child)
-                let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
-                if let ir = shapeToIR(child, kind: kind, cornerRadii: radii, parentBounds: parentBounds) {
-                    items.append(.shape(ir))
+                // VECTOR nodes with an svgId are exported as SVG; fall back to solid-fill rectangle.
+                if child.type == .vector, let ir = svgToIR(child, parentBounds: parentBounds) {
+                    items.append(.svg(ir))
+                } else {
+                    let radii = cornerRadii(for: child)
+                    let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
+                    if let ir = shapeToIR(child, kind: kind, cornerRadii: radii, parentBounds: parentBounds) {
+                        items.append(.shape(ir))
+                    }
                 }
             case .ellipse:
                 if let ir = shapeToIR(child, kind: .ellipse, cornerRadii: nil, parentBounds: parentBounds) {
@@ -166,6 +171,29 @@ enum CanvasInstructionMapper {
             }
         }
         return items
+    }
+
+    // MARK: - Single SVG → IR
+
+    private static func svgToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasSvgIR? {
+        guard let svgId = node.svgId,
+              let b = node.absoluteBoundingBox else { return nil }
+        let x: Int
+        let y: Int
+        if let p = parentBounds {
+            x = Int((b.x - p.x).rounded())
+            y = Int((p.height - (b.y - p.y) - b.height).rounded())
+        } else {
+            x = Int(b.x.rounded())
+            y = Int(b.y.rounded())
+        }
+        return CanvasSvgIR(
+            x: x, y: y,
+            width: Int(b.width.rounded()),
+            height: Int(b.height.rounded()),
+            svgId: svgId,
+            opacity: node.effectiveOpacity
+        )
     }
 
     // MARK: - Single shape → IR
