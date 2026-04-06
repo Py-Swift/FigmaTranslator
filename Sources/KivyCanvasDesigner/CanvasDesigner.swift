@@ -20,4 +20,9 @@ public enum CanvasDesigner {
         let nodes = try JSONDecoder().decode([FigmaNode].self, from: data)
         return generate(nodes: nodes, scalable: scalable, smooth: smooth)
     }
+
+    /// Map nodes to canvas IR without generating code — for use by `KivyWidgetDesigner`.
+    public static func mapToIR(nodes: [FigmaNode]) -> [CanvasFrameIR] {
+        CanvasInstructionMapper.map(nodes: nodes)
+    }
 }

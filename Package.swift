@@ -10,11 +10,12 @@ let figmaApi: Package.Dependency = local
 let pySwiftAST: Package.Dependency = .package(url: "https://github.com/Py-Swift/PySwiftAST.git", branch: "master")
 
 let package = Package(
-    name: "Figma2Kv",
+    name: "FigmaTranslator",
     platforms: [.macOS(.v15)],
     products: [
-        .library(name: "Figma2Kv", targets: ["Figma2Kv"]),
+        .library(name: "FigmaTranslator", targets: ["FigmaTranslator"]),
         .library(name: "KivyCanvasDesigner", targets: ["KivyCanvasDesigner"]),
+        .library(name: "KivyWidgetDesigner", targets: ["KivyWidgetDesigner"]),
     ],
     dependencies: [
         figmaApi,
@@ -23,7 +24,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "Figma2Kv",
+            name: "FigmaTranslator",
             dependencies: [
                 .product(name: "FigmaApi", package: "FigmaApi"),
                 .product(name: "KvParser", package: "SwiftyKvLang"),
@@ -39,6 +40,17 @@ let package = Package(
                 .product(name: "FigmaApi", package: "FigmaApi"),
                 .product(name: "PySwiftCodeGen", package: "PySwiftAST"),
                 .product(name: "KivyWidgetRegistry", package: "SwiftyKvLang"),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
+        ),
+        .target(
+            name: "KivyWidgetDesigner",
+            dependencies: [
+                .product(name: "FigmaApi", package: "FigmaApi"),
+                .product(name: "PySwiftCodeGen", package: "PySwiftAST"),
+                .target(name: "KivyCanvasDesigner"),
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v5),

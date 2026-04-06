@@ -73,10 +73,13 @@ enum CanvasInstructionMapper {
 
     /// Derives the canvas layers for a frame node.
     ///
-    /// - If the node itself is a canvas-layer sentinel (`<canvas>` etc.) → single layer
-    ///   using the node's own children.
+    /// The `<canvas>`, `<canvas.before>`, and `<canvas.after>` group labels are the
+    /// **authoritative** boundary: only content inside those groups becomes canvas
+    /// instructions.  Everything else in the frame is treated as a plain widget child.
+    ///
+    /// - If the node itself is a canvas-layer sentinel → single layer from its children.
     /// - If any direct children are canvas-layer sentinels → one layer per named child.
-    /// - Fallback → all shapes collected recursively → single `.before` layer.
+    /// - No sentinel found → returns an empty array (no canvas for this frame).
     private static func canvasLayersFor(
         _ node: FigmaNode,
         parentBounds: FigmaBounds?
@@ -87,17 +90,14 @@ enum CanvasInstructionMapper {
             return [CanvasLayerIR(target: target, items: items)]
         }
 
-        // Case 2: look for named canvas children.
+        // Case 2: look for named canvas children — only items inside those groups count.
+        // The <canvas>/<canvas.before>/<canvas.after> labels are required; no sentinel = no canvas.
         let namedLayers: [CanvasLayerIR] = (node.children ?? []).compactMap { child in
             guard let target = canvasTarget(for: child.name) else { return nil }
             let items = collectItems(child.children ?? [], parentBounds: parentBounds)
             return CanvasLayerIR(target: target, items: items)
         }
-        if !namedLayers.isEmpty { return namedLayers }
-
-        // Case 3: fallback — collect all items and put them in canvas.before.
-        let items = collectItems(node.children ?? [], parentBounds: parentBounds)
-        return [CanvasLayerIR(target: .before, items: items)]
+        return namedLayers
     }
 
     // MARK: - Item collection (recursive)
@@ -109,6 +109,11 @@ enum CanvasInstructionMapper {
         var items: [CanvasItem] = []
         for child in children {
             guard child.isVisible else { continue }
+            // Any node type can carry an IMAGE fill — check first before type-specific handling.
+            if let ir = imageToIR(child, parentBounds: parentBounds) {
+                items.append(.image(ir))
+                continue
+            }
             switch child.type {
             case .rectangle, .vector:
                 let radii = cornerRadii(for: child)
@@ -123,6 +128,10 @@ enum CanvasInstructionMapper {
             case .polygon, .regularPolygon:
                 if let ir = shapeToIR(child, kind: .triangle, cornerRadii: nil, parentBounds: parentBounds) {
                     items.append(.shape(ir))
+                }
+            case .text:
+                if let ir = textToIR(child, parentBounds: parentBounds) {
+                    items.append(.text(ir))
                 }
             case .group:
                 if canvasTarget(for: child.name) != nil {
@@ -141,8 +150,17 @@ enum CanvasInstructionMapper {
                     }
                 }
             case .frame, .instance, .component:
-                // Frames are Figma arrangement containers — flatten their children inline.
-                items.append(contentsOf: collectItems(child.children ?? [], parentBounds: parentBounds))
+                // Per spec: any frame/component inside a <canvas> group is a new class container.
+                // Treat the same as a named group — emit an InstructionGroup subclass.
+                let containerItems = collectItems(child.children ?? [], parentBounds: parentBounds)
+                if !containerItems.isEmpty {
+                    items.append(.group(CanvasGroupIR(
+                        className: sanitiseName(child.name),
+                        items: containerItems,
+                        frameWidth:  Int((parentBounds?.width  ?? 0).rounded()),
+                        frameHeight: Int((parentBounds?.height ?? 0).rounded())
+                    )))
+                }
             default:
                 break
             }
@@ -158,8 +176,17 @@ enum CanvasInstructionMapper {
         cornerRadii: [Double]?,
         parentBounds: FigmaBounds?
     ) -> CanvasShapeIR? {
-        guard let (color, paintOpacity) = solidColorAndOpacity(from: node.fills),
-              let b = node.absoluteBoundingBox else { return nil }
+        guard let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) else { return nil }
+        // Polygons: absoluteBoundingBox covers the full square tile; absoluteRenderBounds
+        // tightly wraps the actual shape, giving correct position and height.
+        let b: FigmaBounds
+        if kind == .triangle, let rb = node.absoluteRenderBounds {
+            b = rb
+        } else if let bb = node.absoluteBoundingBox {
+            b = bb
+        } else {
+            return nil
+        }
         let nodeOpacity = node.effectiveOpacity
 
         let x: Int
@@ -184,6 +211,72 @@ enum CanvasInstructionMapper {
         )
     }
 
+    // MARK: - Single text → IR
+
+    private static func textToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasTextIR? {
+        guard let text = node.characters, !text.isEmpty else { return nil }
+        // absoluteRenderBounds tightly wraps the actual rendered glyphs; fall back to
+        // absoluteBoundingBox if renderBounds is absent.
+        guard let b = node.absoluteRenderBounds ?? node.absoluteBoundingBox else { return nil }
+
+        let x: Int
+        let y: Int
+        if let p = parentBounds {
+            x = Int((b.x - p.x).rounded())
+            y = Int((p.height - (b.y - p.y) - b.height).rounded())
+        } else {
+            x = Int(b.x.rounded())
+            y = Int(b.y.rounded())
+        }
+        let w = Int(b.width.rounded())
+        let h = Int(b.height.rounded())
+
+        // Font size: prefer Plugin API direct field, fall back to style, default 14
+        let rawSize = node.fontSize ?? node.style?.fontSize ?? 14
+        let fontSize = max(1, Int(rawSize.rounded()))
+
+        // Bold / italic from fontName.style string (Plugin API) or FigmaTypeStyle
+        let styleStr = (node.fontName?.style ?? node.style?.fontStyle ?? "").lowercased()
+        let bold   = styleStr.contains("bold")
+        let italic = styleStr.contains("italic") || styleStr.contains("oblique")
+
+        // Font family
+        let fontFamily = node.fontName?.family ?? node.style?.fontFamily ?? ""
+
+        // Halign mapping from Figma → Kivy
+        let halignRaw = node.textAlignHorizontal ?? node.style?.textAlignHorizontal ?? "LEFT"
+        let halign: String
+        switch halignRaw.uppercased() {
+        case "CENTER":    halign = "center"
+        case "RIGHT":     halign = "right"
+        case "JUSTIFIED": halign = "justify"
+        default:          halign = "left"
+        }
+
+        // Color from fills; default opaque white
+        let nodeOpacity = node.effectiveOpacity
+        let r, g, b2, a: Double
+        if let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) {
+            r  = color.r
+            g  = color.g
+            b2 = color.b
+            a  = color.alpha * paintOpacity * nodeOpacity
+        } else {
+            r = 1; g = 1; b2 = 1; a = nodeOpacity
+        }
+
+        return CanvasTextIR(
+            x: x, y: y, width: w, height: h,
+            r: r, g: g, b: b2, a: a,
+            text: text,
+            fontSize: fontSize,
+            bold: bold,
+            italic: italic,
+            halign: halign,
+            fontFamily: fontFamily
+        )
+    }
+
     /// Returns per-corner radii [tl, tr, br, bl] if the node has any non-zero corner,
     /// otherwise `nil`.
     private static func cornerRadii(for node: FigmaNode) -> [Double]? {
@@ -204,6 +297,36 @@ enum CanvasInstructionMapper {
         guard let paint = fills?.first(where: { $0.type == .solid && $0.visible != false }),
               let color = paint.color else { return nil }
         return (color, paint.effectiveOpacity)
+    }
+
+    private static func imageRefAndOpacity(from fills: [FigmaPaint]?) -> (String, Double)? {
+        guard let paint = fills?.first(where: { $0.type == .image && $0.visible != false }),
+              let ref = paint.imageRef else { return nil }
+        return (ref, paint.effectiveOpacity)
+    }
+
+    // MARK: - Single image → IR
+
+    private static func imageToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasImageIR? {
+        guard let (ref, paintOpacity) = imageRefAndOpacity(from: node.fills),
+              let b = node.absoluteBoundingBox else { return nil }
+        let nodeOpacity = node.effectiveOpacity
+        let x: Int
+        let y: Int
+        if let p = parentBounds {
+            x = Int((b.x - p.x).rounded())
+            y = Int((p.height - (b.y - p.y) - b.height).rounded())
+        } else {
+            x = Int(b.x.rounded())
+            y = Int(b.y.rounded())
+        }
+        return CanvasImageIR(
+            x: x, y: y,
+            width:  Int(b.width.rounded()),
+            height: Int(b.height.rounded()),
+            imageRef: ref,
+            opacity: paintOpacity * nodeOpacity
+        )
     }
 
     static func sanitiseName(_ name: String) -> String {

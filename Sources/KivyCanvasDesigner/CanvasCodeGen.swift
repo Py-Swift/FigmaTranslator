@@ -1,14 +1,33 @@
 import PySwiftAST
 import PySwiftCodeGen
 
+// MARK: - Public embed data
+
+/// Data returned by `CanvasCodeGen.canvasEmbedData()` for use by `KivyWidgetDesigner`.
+public struct CanvasEmbedData {
+    /// Canvas `__init__` statements to splice into a Widget subclass (no `super().__init__` call).
+    public let initStmts: [Statement]
+    /// A `_update_canvas(self, *args)` method if any instructions are size-dependent.
+    public let updateMethod: Statement?
+    /// `kivy.graphics` names required (e.g. `["Color", "Rectangle"]`).
+    public let graphicsNames: [String]
+    /// Font family names referenced by text instructions.
+    public let fontFamilies: [String]
+    /// Image-hash refs referenced by image instructions.
+    public let imageRefs: [String]
+    /// Whether a `CoreLabel` import is needed.
+    public let needsCoreLabel: Bool
+}
+
 // MARK: - Code Generator
 
-enum CanvasCodeGen {
+public enum CanvasCodeGen {
 
     private struct GeneratedRef {
         enum Kind {
             case shape(CanvasShapeIR)
             case group(CanvasGroupIR)
+            case text(CanvasTextIR, lblAttrName: String)
         }
         let attrName: String
         let kind: Kind
@@ -26,6 +45,9 @@ enum CanvasCodeGen {
         var needsEllipse          = false
         var needsTriangle         = false
         var needsGroups           = false
+        var needsText             = false
+        var fontFamilies: [String] = []   // ordered, deduplicated in insertion order
+        var imageRefs:    [String] = []   // ordered, deduplicated image hashes
         func scanItems(_ items: [CanvasItem]) {
             for item in items {
                 switch item {
@@ -39,6 +61,17 @@ enum CanvasCodeGen {
                 case .group(let g):
                     needsGroups = true
                     scanItems(g.items)
+                case .text(let txt):
+                    needsText      = true
+                    needsRectangle = true
+                    if !txt.fontFamily.isEmpty && !fontFamilies.contains(txt.fontFamily) {
+                        fontFamilies.append(txt.fontFamily)
+                    }
+                case .image(let img):
+                    needsRectangle = true
+                    if !imageRefs.contains(img.imageRef) {
+                        imageRefs.append(img.imageRef)
+                    }
                 }
             }
         }
@@ -64,12 +97,24 @@ enum CanvasCodeGen {
             names: graphicsNames.map { Alias(name: $0, asName: nil) },
             level: 0
         ))
+        let importCoreLabel = Statement.importFrom(ImportFrom(
+            module: "kivy.core.text",
+            names: [Alias(name: "Label", asName: "CoreLabel")],
+            level: 0
+        ))
 
         // Collect all InstructionGroup subclasses in post-order (leafs emitted first).
         let groups = allGroupsPostOrder(frames: frames)
 
-        // Assemble module body: imports → group classes → frame Widget classes.
-        var body: [Statement] = [importWidget, importGraphics]
+        // Assemble module body: imports → font/image registration → group classes → frame Widget classes.
+        var body: [Statement] = needsText ? [importWidget, importGraphics, importCoreLabel]
+                                          : [importWidget, importGraphics]
+        if !fontFamilies.isEmpty {
+            body.append(contentsOf: fontRegistrationStmts(families: fontFamilies))
+        }
+        if !imageRefs.isEmpty {
+            body.append(contentsOf: imageRegistrationStmts(refs: imageRefs))
+        }
         for group in groups {
             body.append(.blank())
             body.append(.blank())
@@ -99,9 +144,16 @@ enum CanvasCodeGen {
         var refs: [GeneratedRef] = []
         let initFunc = initFuncFor(frame, scalable: scalable, smooth: smooth, refs: &refs)
         var body: [Statement] = [initFunc]
-        if scalable && !refs.isEmpty {
+        if !refs.isEmpty {
             body.append(.blank())
-            body.append(updateCanvasFuncFor(frame: frame, refs: refs))
+            body.append(updateCanvasFuncFor(frame: frame, refs: refs, scalable: scalable))
+        }
+        // Generate update_text_N(self, new_text) for each text item
+        for ref in refs {
+            if case .text(_, let lblName) = ref.kind {
+                body.append(.blank())
+                body.append(updateTextFuncFor(rectAttrName: ref.attrName, lblAttrName: lblName))
+            }
         }
         return .classDef(ClassDef(
             name: frame.className,
@@ -207,7 +259,7 @@ enum CanvasCodeGen {
             ))
         }
 
-        if scalable && !refs.isEmpty {
+        if !refs.isEmpty {
             stmts.append(.blank())
             stmts.append(exprStmt(callExpr(
                 fun: attrExpr(nameExpr("self"), "bind"),
@@ -402,6 +454,109 @@ enum CanvasCodeGen {
                 )))
                 stmts.append(cbAdd(ref))
                 refs.append(GeneratedRef(attrName: attrName, kind: .group(group)))
+            case .text(let txt):
+                // Color instruction (reset tracking — text uses its own color)
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(txt.r), floatConst(txt.g),
+                    floatConst(txt.b), floatConst(txt.a)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(colorRef))
+                lastR = txt.r; lastG = txt.g; lastB = txt.b; lastA = txt.a
+
+                // CoreLabel — build once then refresh to get texture
+                let localLbl = "_lbl_\(counter)"
+                var lblKws: [Keyword] = [
+                    Keyword(arg: "text",      value: strConst(txt.text)),
+                    Keyword(arg: "font_size", value: intConst(txt.fontSize))
+                ]
+                if txt.bold   { lblKws.append(Keyword(arg: "bold",   value: boolConst(true))) }
+                if txt.italic { lblKws.append(Keyword(arg: "italic", value: boolConst(true))) }
+                if txt.halign != "left" { lblKws.append(Keyword(arg: "halign", value: strConst(txt.halign))) }
+                if !txt.fontFamily.isEmpty { lblKws.append(Keyword(arg: "font_name", value: nameExpr(CanvasCodeGen.fontConstName(txt.fontFamily)))) }
+                // lbl = CoreLabel(...)
+                stmts.append(.assign(Assign(
+                    targets: [.name(Name(id: localLbl, ctx: .store))],
+                    value: callExpr(fun: nameExpr("CoreLabel"), args: [], keywords: lblKws),
+                    typeComment: nil
+                )))
+                stmts.append(exprStmt(callExpr(fun: attrExpr(nameExpr(localLbl), "refresh"), args: [], keywords: [])))
+                // Store label on self for later updates
+                stmts.append(.assign(Assign(
+                    targets: [attrExpr(nameExpr("self"), localLbl)],
+                    value: .name(Name(id: localLbl, ctx: .load)),
+                    typeComment: nil
+                )))
+
+                // Rectangle with CoreLabel texture
+                let attrName = "text_\(counter)_rect"
+                counter += 1
+                let (pos, _) = posSize(
+                    CanvasShapeIR(kind: .rectangle, x: txt.x, y: txt.y, width: txt.width, height: txt.height,
+                                  r: txt.r, g: txt.g, b: txt.b, a: txt.a, cornerRadii: nil),
+                    scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight,
+                    xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr
+                )
+                let texRef  = attrExpr(nameExpr(localLbl), "texture")
+                let texSize  = attrExpr(attrExpr(nameExpr(localLbl), "texture"), "size")
+                let ref = attrExpr(nameExpr("self"), attrName)
+                stmts.append(.assign(Assign(
+                    targets: [ref],
+                    value: callExpr(fun: nameExpr("Rectangle"), args: [], keywords: [
+                        Keyword(arg: "texture", value: texRef),
+                        Keyword(arg: "pos",     value: pos),
+                        Keyword(arg: "size",    value: texSize)
+                    ]),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(ref))
+                refs.append(GeneratedRef(attrName: attrName, kind: .text(txt, lblAttrName: localLbl)))
+            case .image(let img):
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(1.0), floatConst(1.0), floatConst(1.0), floatConst(img.opacity)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(colorRef))
+                lastR = 1.0; lastG = 1.0; lastB = 1.0; lastA = img.opacity
+
+                let attrName = "img_rect_\(counter)"
+                counter += 1
+                let (pos, size) = posSize(
+                    CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
+                                  r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil),
+                    scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight,
+                    xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr
+                )
+                let imgConstName = CanvasCodeGen.imageConstName(img.imageRef)
+                let imgRef = attrExpr(nameExpr("self"), attrName)
+                stmts.append(.assign(Assign(
+                    targets: [imgRef],
+                    value: callExpr(fun: nameExpr("Rectangle"), args: [], keywords: [
+                        Keyword(arg: "source", value: nameExpr(imgConstName)),
+                        Keyword(arg: "pos",    value: pos),
+                        Keyword(arg: "size",   value: size)
+                    ]),
+                    typeComment: nil
+                )))
+                stmts.append(cbAdd(imgRef))
+                refs.append(GeneratedRef(attrName: attrName, kind: .shape(
+                    CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
+                                  r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil)
+                )))
             }
         }
         return stmts
@@ -493,6 +648,105 @@ enum CanvasCodeGen {
                 )))
                 stmts.append(selfAdd(ref))
                 refs.append(GeneratedRef(attrName: attrName, kind: .group(group)))
+            case .text(let txt):
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(txt.r), floatConst(txt.g),
+                    floatConst(txt.b), floatConst(txt.a)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(colorRef))
+                lastR = txt.r; lastG = txt.g; lastB = txt.b; lastA = txt.a
+
+                let localLbl = "_lbl_\(counter)"
+                var lblKws: [Keyword] = [
+                    Keyword(arg: "text",      value: strConst(txt.text)),
+                    Keyword(arg: "font_size", value: intConst(txt.fontSize))
+                ]
+                if txt.bold   { lblKws.append(Keyword(arg: "bold",   value: boolConst(true))) }
+                if txt.italic { lblKws.append(Keyword(arg: "italic", value: boolConst(true))) }
+                if txt.halign != "left" { lblKws.append(Keyword(arg: "halign", value: strConst(txt.halign))) }
+                if !txt.fontFamily.isEmpty { lblKws.append(Keyword(arg: "font_name", value: nameExpr(CanvasCodeGen.fontConstName(txt.fontFamily)))) }
+                stmts.append(.assign(Assign(
+                    targets: [.name(Name(id: localLbl, ctx: .store))],
+                    value: callExpr(fun: nameExpr("CoreLabel"), args: [], keywords: lblKws),
+                    typeComment: nil
+                )))
+                stmts.append(exprStmt(callExpr(fun: attrExpr(nameExpr(localLbl), "refresh"), args: [], keywords: [])))
+                // Store label on self for later updates
+                stmts.append(.assign(Assign(
+                    targets: [attrExpr(nameExpr("self"), localLbl)],
+                    value: .name(Name(id: localLbl, ctx: .load)),
+                    typeComment: nil
+                )))
+
+                let attrName = "text_\(counter)_rect"
+                counter += 1
+                let (pos, _) = posSize(
+                    CanvasShapeIR(kind: .rectangle, x: txt.x, y: txt.y, width: txt.width, height: txt.height,
+                                  r: txt.r, g: txt.g, b: txt.b, a: txt.a, cornerRadii: nil),
+                    scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight,
+                    xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr
+                )
+                let texRef  = attrExpr(nameExpr(localLbl), "texture")
+                let texSize  = attrExpr(attrExpr(nameExpr(localLbl), "texture"), "size")
+                let ref = attrExpr(nameExpr("self"), attrName)
+                stmts.append(.assign(Assign(
+                    targets: [ref],
+                    value: callExpr(fun: nameExpr("Rectangle"), args: [], keywords: [
+                        Keyword(arg: "texture", value: texRef),
+                        Keyword(arg: "pos",     value: pos),
+                        Keyword(arg: "size",    value: texSize)
+                    ]),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(ref))
+                refs.append(GeneratedRef(attrName: attrName, kind: .text(txt, lblAttrName: localLbl)))
+            case .image(let img):
+                let rgba = Expression.tuple(Tuple(elts: [
+                    floatConst(1.0), floatConst(1.0), floatConst(1.0), floatConst(img.opacity)
+                ]))
+                let colorName = "color_\(counter)"
+                counter += 1
+                let colorRef = attrExpr(nameExpr("self"), colorName)
+                stmts.append(.assign(Assign(
+                    targets: [colorRef],
+                    value: callExpr(fun: nameExpr("Color"), args: [], keywords: [Keyword(arg: "rgba", value: rgba)]),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(colorRef))
+                lastR = 1.0; lastG = 1.0; lastB = 1.0; lastA = img.opacity
+
+                let attrName = "img_rect_\(counter)"
+                counter += 1
+                let (pos, size) = posSize(
+                    CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
+                                  r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil),
+                    scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight,
+                    xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr
+                )
+                let imgConstName = CanvasCodeGen.imageConstName(img.imageRef)
+                let imgRef = attrExpr(nameExpr("self"), attrName)
+                stmts.append(.assign(Assign(
+                    targets: [imgRef],
+                    value: callExpr(fun: nameExpr("Rectangle"), args: [], keywords: [
+                        Keyword(arg: "source", value: nameExpr(imgConstName)),
+                        Keyword(arg: "pos",    value: pos),
+                        Keyword(arg: "size",   value: size)
+                    ]),
+                    typeComment: nil
+                )))
+                stmts.append(selfAdd(imgRef))
+                refs.append(GeneratedRef(attrName: attrName, kind: .shape(
+                    CanvasShapeIR(kind: .rectangle, x: img.x, y: img.y, width: img.width, height: img.height,
+                                  r: 1, g: 1, b: 1, a: img.opacity, cornerRadii: nil)
+                )))
             }
         }
         return stmts
@@ -590,6 +844,14 @@ enum CanvasCodeGen {
         .constant(Constant(value: .float(v)))
     }
 
+    private static func strConst(_ v: String) -> Expression {
+        .constant(Constant(value: .string(v)))
+    }
+
+    private static func boolConst(_ v: Bool) -> Expression {
+        .constant(Constant(value: .bool(v)))
+    }
+
     /// Returns `dimExpr * pct` where pct = value/frameDim, up to 8 significant decimal places
     /// but trailing zeros are stripped automatically by Swift's String(Double) formatting.
     private static func scaledCoord(_ value: Int, _ frameDim: Int, _ dimExpr: Expression) -> Expression {
@@ -623,24 +885,47 @@ enum CanvasCodeGen {
             switch ref.kind {
             case .shape(let shape):
                 if shape.kind == .triangle {
-                    let pts = triPoints(shape, scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight, xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr)
+                    let pts: Expression
+                    if scalable, let xe = xExpr, let ye = yExpr, let we = widthExpr, let he = heightExpr,
+                       frameWidth > 0, frameHeight > 0 {
+                        pts = triPoints(shape, scalable: true, frameWidth: frameWidth, frameHeight: frameHeight, xe: xe, ye: ye, we: we, he: he)
+                    } else if let xe = xExpr, let ye = yExpr {
+                        let x0 = Expression.binOp(BinOp(left: xe, op: .add, right: intConst(shape.x)))
+                        let x1 = Expression.binOp(BinOp(left: xe, op: .add, right: intConst(shape.x + shape.width)))
+                        let x2 = Expression.binOp(BinOp(left: xe, op: .add, right: intConst(shape.x + shape.width / 2)))
+                        let y0 = Expression.binOp(BinOp(left: ye, op: .add, right: intConst(shape.y)))
+                        let y1 = Expression.binOp(BinOp(left: ye, op: .add, right: intConst(shape.y + shape.height)))
+                        pts = .list(List(elts: [x0, y0, x1, y0, x2, y1]))
+                    } else {
+                        pts = triPoints(shape, scalable: false, frameWidth: frameWidth, frameHeight: frameHeight, xe: nil, ye: nil, we: nil, he: nil)
+                    }
                     stmts.append(.assign(Assign(
                         targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "points")],
                         value: pts,
                         typeComment: nil
                     )))
                 } else {
-                    let (pos, size) = posSize(shape, scalable: scalable, frameWidth: frameWidth, frameHeight: frameHeight, xe: xExpr, ye: yExpr, we: widthExpr, he: heightExpr)
-                    stmts.append(.assign(Assign(
-                        targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "pos")],
-                        value: pos,
-                        typeComment: nil
-                    )))
-                    stmts.append(.assign(Assign(
-                        targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "size")],
-                        value: size,
-                        typeComment: nil
-                    )))
+                    if scalable, let xe = xExpr, let ye = yExpr, let we = widthExpr, let he = heightExpr,
+                       frameWidth > 0, frameHeight > 0 {
+                        let (pos, size) = posSize(shape, scalable: true, frameWidth: frameWidth, frameHeight: frameHeight, xe: xe, ye: ye, we: we, he: he)
+                        stmts.append(.assign(Assign(
+                            targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "pos")],
+                            value: pos, typeComment: nil
+                        )))
+                        stmts.append(.assign(Assign(
+                            targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "size")],
+                            value: size, typeComment: nil
+                        )))
+                    } else if let xe = xExpr, let ye = yExpr {
+                        let pos = Expression.tuple(Tuple(elts: [
+                            .binOp(BinOp(left: xe, op: .add, right: intConst(shape.x))),
+                            .binOp(BinOp(left: ye, op: .add, right: intConst(shape.y)))
+                        ]))
+                        stmts.append(.assign(Assign(
+                            targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "pos")],
+                            value: pos, typeComment: nil
+                        )))
+                    }
                 }
             case .group:
                 if scalable, let xe = xExpr, let ye = yExpr, let we = widthExpr, let he = heightExpr {
@@ -650,12 +935,243 @@ enum CanvasCodeGen {
                         keywords: []
                     )))
                 }
+            case .text(let txt, _):
+                // Only update pos — size stays as texture_size (determined by font).
+                let pos: Expression
+                if scalable, let xe = xExpr, let ye = yExpr, let we = widthExpr, let he = heightExpr,
+                   frameWidth > 0, frameHeight > 0 {
+                    let (scaledPos, _) = posSize(
+                        CanvasShapeIR(kind: .rectangle, x: txt.x, y: txt.y, width: txt.width, height: txt.height,
+                                      r: txt.r, g: txt.g, b: txt.b, a: txt.a, cornerRadii: nil),
+                        scalable: true, frameWidth: frameWidth, frameHeight: frameHeight,
+                        xe: xe, ye: ye, we: we, he: he
+                    )
+                    pos = scaledPos
+                } else if let xe = xExpr, let ye = yExpr {
+                    pos = .tuple(Tuple(elts: [
+                        .binOp(BinOp(left: xe, op: .add, right: intConst(txt.x))),
+                        .binOp(BinOp(left: ye, op: .add, right: intConst(txt.y)))
+                    ]))
+                } else {
+                    break
+                }
+                stmts.append(.assign(Assign(
+                    targets: [attrExpr(attrExpr(nameExpr("self"), ref.attrName), "pos")],
+                    value: pos,
+                    typeComment: nil
+                )))
             }
         }
         return stmts
     }
 
-    private static func updateCanvasFuncFor(frame: CanvasFrameIR, refs: [GeneratedRef]) -> Statement {
+    /// Converts a font family name to a Python module-level constant name.
+    /// e.g. "Comic Sans MS" → "COMIC_SANS_MS"
+    private static func fontConstName(_ family: String) -> String {
+        family.uppercased().replacingOccurrences(of: " ", with: "_")
+    }
+
+    /// Converts an image hash to a Python module-level constant name.
+    /// Uses the first 16 hex characters to keep identifiers readable.
+    /// e.g. "72963454773dc84b7bd498d055424636a99d576c" → "IMG_72963454773DC84B"
+    static func imageConstName(_ hash: String) -> String {
+        let prefix = String(hash.prefix(16)).uppercased()
+        return "IMG_\(prefix)"
+    }
+
+    /// Emits module-level statements that download each image from FIGMA_SERVER_URL
+    /// into a temp file and bind a constant to its path, e.g.:
+    ///   IMG_72963454773DC84B = _os.path.join(_tempfile.gettempdir(), "images", "72963454773dc84b.png")
+    ///   if not _os.path.exists(IMG_72963454773DC84B):
+    ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/image/HASH", IMG_72963454773DC84B)
+    private static func imageRegistrationStmts(refs: [String]) -> [Statement] {
+        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
+        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",              asName: "_os")]))
+        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",        asName: "_tempfile")]))
+
+        // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "images"), exist_ok=True)
+        let fontsDirExpr = callExpr(
+            fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+            args: [
+                callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                strConst("images")
+            ],
+            keywords: []
+        )
+        let makedirs = exprStmt(callExpr(
+            fun: attrExpr(nameExpr("_os"), "makedirs"),
+            args: [fontsDirExpr],
+            keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
+        ))
+
+        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+
+        for ref in refs {
+            let constName    = imageConstName(ref)
+            let fileBasename = String(ref.prefix(16)) + ".png"
+
+            // IMG_xxx = _os.path.join(_tempfile.gettempdir(), "images", "xxxxxxxxxxxxxxxx.png")
+            let constAssign = Statement.assign(Assign(
+                targets: [.name(Name(id: constName, ctx: .store))],
+                value: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+                    args: [
+                        callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                        strConst("images"),
+                        strConst(fileBasename)
+                    ],
+                    keywords: []
+                ),
+                typeComment: nil
+            ))
+
+            // _os.environ["FIGMA_SERVER_URL"] + "/image/HASH"
+            let serverUrl = Expression.subscriptExpr(Subscript(
+                value: attrExpr(nameExpr("_os"), "environ"),
+                slice: strConst("FIGMA_SERVER_URL")
+            ))
+            let downloadUrl = Expression.binOp(BinOp(
+                left: serverUrl, op: .add, right: strConst("/image/\(ref)")
+            ))
+
+            let urlretrieve = exprStmt(callExpr(
+                fun: attrExpr(nameExpr("_urllib_request"), "urlretrieve"),
+                args: [downloadUrl, nameExpr(constName)],
+                keywords: []
+            ))
+
+            let ifNotExists = Statement.ifStmt(If(
+                test: Expression.unaryOp(UnaryOp(op: .not, operand: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "exists"),
+                    args: [nameExpr(constName)], keywords: []
+                ))),
+                body: [urlretrieve],
+                orElse: []
+            ))
+
+            stmts.append(.blank())
+            stmts.append(constAssign)
+            stmts.append(ifNotExists)
+        }
+        return stmts
+    }
+
+    /// Emits module-level statements that download each font from FIGMA_SERVER_URL
+    /// into a temp file and bind a constant to its path, e.g.:
+    ///   COMIC_SANS_MS = _os.path.join(_tempfile.gettempdir(), "fonts", "Comic_Sans_MS.ttf")
+    ///   if not _os.path.exists(COMIC_SANS_MS):
+    ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/font/Comic%20Sans%20MS", COMIC_SANS_MS)
+    private static func fontRegistrationStmts(families: [String]) -> [Statement] {
+        let importUrllib  = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
+        let importOs      = Statement.importStmt(Import(names: [Alias(name: "os",              asName: "_os")]))
+        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",       asName: "_tempfile")]))
+
+        // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "fonts"), exist_ok=True)
+        let fontsDirExpr = callExpr(
+            fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+            args: [
+                callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                strConst("fonts")
+            ],
+            keywords: []
+        )
+        let makedirs = exprStmt(callExpr(
+            fun: attrExpr(nameExpr("_os"), "makedirs"),
+            args: [fontsDirExpr],
+            keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
+        ))
+
+        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+
+        for family in families {
+            let constName    = fontConstName(family)
+            let fileBasename = family.replacingOccurrences(of: " ", with: "_") + ".ttf"
+            let familyEncoded = family.replacingOccurrences(of: " ", with: "%20")
+
+            // COMIC_SANS_MS = _os.path.join(_tempfile.gettempdir(), "fonts", "Comic_Sans_MS.ttf")
+            let constAssign = Statement.assign(Assign(
+                targets: [.name(Name(id: constName, ctx: .store))],
+                value: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
+                    args: [
+                        callExpr(fun: attrExpr(nameExpr("_tempfile"), "gettempdir"), args: [], keywords: []),
+                        strConst("fonts"),
+                        strConst(fileBasename)
+                    ],
+                    keywords: []
+                ),
+                typeComment: nil
+            ))
+
+            // _os.environ["FIGMA_SERVER_URL"] + "/font/Comic%20Sans%20MS"
+            let serverUrl = Expression.subscriptExpr(Subscript(
+                value: attrExpr(nameExpr("_os"), "environ"),
+                slice: strConst("FIGMA_SERVER_URL")
+            ))
+            let downloadUrl = Expression.binOp(BinOp(
+                left: serverUrl, op: .add, right: strConst("/font/\(familyEncoded)")
+            ))
+
+            // _urllib_request.urlretrieve(url, COMIC_SANS_MS)
+            let urlretrieve = exprStmt(callExpr(
+                fun: attrExpr(nameExpr("_urllib_request"), "urlretrieve"),
+                args: [downloadUrl, nameExpr(constName)],
+                keywords: []
+            ))
+
+            // if not _os.path.exists(COMIC_SANS_MS): _urllib_request.urlretrieve(...)
+            let ifNotExists = Statement.ifStmt(If(
+                test: Expression.unaryOp(UnaryOp(op: .not, operand: callExpr(
+                    fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "exists"),
+                    args: [nameExpr(constName)], keywords: []
+                ))),
+                body: [urlretrieve],
+                orElse: []
+            ))
+
+            stmts.append(.blank())
+            stmts.append(constAssign)
+            stmts.append(ifNotExists)
+        }
+        return stmts
+    }
+
+    /// Generates `update_text_N(self, new_text)` that refreshes the CoreLabel and updates the Rectangle.
+    private static func updateTextFuncFor(rectAttrName: String, lblAttrName: String) -> Statement {
+        // Method name: "text_4_rect" -> "update_text_4"
+        let methodName = "update_" + rectAttrName.replacingOccurrences(of: "_rect", with: "")
+        let labelVar = nameExpr("label")
+        let newTextVar = nameExpr("new_text")
+        let selfLbl = attrExpr(nameExpr("self"), lblAttrName)
+        let selfRect = attrExpr(nameExpr("self"), rectAttrName)
+        let body: [Statement] = [
+            // label = self._lbl_N
+            .assign(Assign(targets: [labelVar], value: selfLbl, typeComment: nil)),
+            // label.text = new_text
+            .assign(Assign(targets: [attrExpr(labelVar, "text")], value: newTextVar, typeComment: nil)),
+            // label.refresh()
+            exprStmt(callExpr(fun: attrExpr(labelVar, "refresh"), args: [], keywords: [])),
+            // self.text_N_rect.texture = label.texture
+            .assign(Assign(
+                targets: [attrExpr(selfRect, "texture")],
+                value: attrExpr(labelVar, "texture"),
+                typeComment: nil
+            )),
+            // self.text_N_rect.size = label.texture.size
+            .assign(Assign(
+                targets: [attrExpr(selfRect, "size")],
+                value: attrExpr(attrExpr(labelVar, "texture"), "size"),
+                typeComment: nil
+            )),
+        ]
+        return .functionDef(FunctionDef(
+            name: methodName,
+            args: Arguments(args: [Arg(arg: "self"), Arg(arg: "new_text")]),
+            body: body
+        ))
+    }
+
+    private static func updateCanvasFuncFor(frame: CanvasFrameIR, refs: [GeneratedRef], scalable: Bool) -> Statement {
         let xE = nameExpr("x"); let yE = nameExpr("y")
         let wE = nameExpr("w"); let hE = nameExpr("h")
         var body: [Statement] = []
@@ -671,7 +1187,7 @@ enum CanvasCodeGen {
             typeComment: nil
         )))
         body.append(contentsOf: updateStmts(
-            refs: refs, scalable: true,
+            refs: refs, scalable: scalable,
             frameWidth: frame.width, frameHeight: frame.height,
             xExpr: xE, yExpr: yE, widthExpr: wE, heightExpr: hE
         ))
@@ -695,5 +1211,71 @@ enum CanvasCodeGen {
             args: Arguments(args: [Arg(arg: "self"), Arg(arg: "x"), Arg(arg: "y"), Arg(arg: "w"), Arg(arg: "h")]),
             body: body
         ))
+    }
+
+    // MARK: - Public embed API (used by KivyWidgetDesigner)
+
+    /// Returns canvas init statements + optional update method for embedding inside
+    /// an externally-generated Widget subclass (e.g. BoxLayout).
+    /// The `super().__init__` call is **not** included in `initStmts`.
+    public static func canvasEmbedData(
+        for frame: CanvasFrameIR,
+        scalable: Bool = false,
+        smooth: SmoothOptions = .init()
+    ) -> CanvasEmbedData {
+        var refs: [GeneratedRef] = []
+        let allStmts = initBodyFor(frame, scalable: scalable, smooth: smooth, refs: &refs)
+        let initStmts = Array(allStmts.dropFirst())   // drop super().__init__(**kwargs)
+        let updateMethod: Statement? = refs.isEmpty ? nil
+            : updateCanvasFuncFor(frame: frame, refs: refs, scalable: scalable)
+
+        // Scan canvas layers for required graphics names.
+        var needsR = false, needsRR = false, needsE = false, needsT = false
+        var needsG = false, needsCoreLabel = false
+        var fontFamilies: [String] = []
+        var imageRefs:    [String] = []
+
+        func scan(_ items: [CanvasItem]) {
+            for item in items {
+                switch item {
+                case .shape(let s):
+                    switch s.kind {
+                    case .rectangle:        needsR  = true
+                    case .roundedRectangle: needsRR = true
+                    case .ellipse:          needsE  = true
+                    case .triangle:         needsT  = true
+                    }
+                case .group(let g):
+                    needsG = true
+                    scan(g.items)
+                case .text(let t):
+                    needsCoreLabel = true
+                    needsR         = true
+                    if !t.fontFamily.isEmpty, !fontFamilies.contains(t.fontFamily) {
+                        fontFamilies.append(t.fontFamily)
+                    }
+                case .image(let img):
+                    needsR = true
+                    if !imageRefs.contains(img.imageRef) { imageRefs.append(img.imageRef) }
+                }
+            }
+        }
+        for layer in frame.layers { scan(layer.items) }
+
+        var names = ["Color"]
+        if needsR  { names.append(smooth.rectangle        ? "SmoothRectangle"        : "Rectangle") }
+        if needsRR { names.append(smooth.roundedRectangle ? "SmoothRoundedRectangle" : "RoundedRectangle") }
+        if needsE  { names.append(smooth.ellipse          ? "SmoothEllipse"          : "Ellipse") }
+        if needsT  { names.append(smooth.triangle         ? "SmoothTriangle"         : "Triangle") }
+        if needsG  { names.append("InstructionGroup") }
+
+        return CanvasEmbedData(
+            initStmts:     initStmts,
+            updateMethod:  updateMethod,
+            graphicsNames: names,
+            fontFamilies:  fontFamilies,
+            imageRefs:     imageRefs,
+            needsCoreLabel: needsCoreLabel
+        )
     }
 }

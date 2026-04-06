@@ -59,12 +59,53 @@ public enum CanvasTarget {
     case main     // self.canvas
 }
 
+// MARK: - Text IR
+
+/// Intermediate representation of a Figma TEXT node rendered via CoreLabel onto the canvas.
+public struct CanvasTextIR {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+    /// RGBA fill (0.0 – 1.0).
+    public let r: Double
+    public let g: Double
+    public let b: Double
+    public let a: Double
+    /// Raw text content.
+    public let text: String
+    /// Font size in integer points.
+    public let fontSize: Int
+    public let bold: Bool
+    public let italic: Bool
+    /// Kivy halign string: "left", "center", "right", "justify"
+    public let halign: String
+    /// Font family name (e.g. "Roboto"). Empty string means use Kivy default.
+    public let fontFamily: String
+}
+
+// MARK: - Image IR
+
+/// Intermediate representation of a Figma RECTANGLE node with an IMAGE fill.
+public struct CanvasImageIR {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+    /// The image hash from Figma (used to fetch from FIGMA_SERVER_URL/image/:hash).
+    public let imageRef: String
+    /// Node-level opacity * paint opacity.
+    public let opacity: Double
+}
+
 // MARK: - Item tree (shapes + nested groups)
 
-/// A canvas renderable: either a leaf shape or a nested InstructionGroup.
+/// A canvas renderable: either a leaf shape, a nested InstructionGroup, a text label, or an image.
 public indirect enum CanvasItem {
     case shape(CanvasShapeIR)
     case group(CanvasGroupIR)
+    case text(CanvasTextIR)
+    case image(CanvasImageIR)
 }
 
 /// A named Kivy `InstructionGroup` emitted as its own Python class.
@@ -93,4 +134,11 @@ public struct CanvasFrameIR {
     public let height: Int
     /// One entry per `<canvas.before>` / `<canvas.after>` / `<canvas>` layer found.
     public let layers: [CanvasLayerIR]
+
+    public init(className: String, width: Int, height: Int, layers: [CanvasLayerIR]) {
+        self.className = className
+        self.width     = width
+        self.height    = height
+        self.layers    = layers
+    }
 }
