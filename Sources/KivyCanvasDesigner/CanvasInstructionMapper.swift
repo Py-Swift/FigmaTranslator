@@ -116,7 +116,7 @@ enum CanvasInstructionMapper {
             }
             switch child.type {
             case .rectangle, .vector:
-                // VECTOR nodes with an svgId are exported as SVG; fall back to solid-fill rectangle.
+                // VECTOR nodes with vectorPaths are exported as SVG; fall back to solid-fill rectangle.
                 if child.type == .vector, let ir = svgToIR(child, parentBounds: parentBounds) {
                     items.append(.svg(ir))
                 } else {
@@ -176,8 +176,33 @@ enum CanvasInstructionMapper {
     // MARK: - Single SVG → IR
 
     private static func svgToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasSvgIR? {
-        guard let svgId = node.svgId,
+        guard let paths = node.vectorPaths, !paths.isEmpty,
               let b = node.absoluteBoundingBox else { return nil }
+
+        let w = Int(b.width.rounded())
+        let h = Int(b.height.rounded())
+
+        // Derive fill colour from the node's fills (first visible solid paint, or "none").
+        let fillStr: String
+        if let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) {
+            let r = Int((color.r * 255).rounded())
+            let g = Int((color.g * 255).rounded())
+            let bv = Int((color.b * 255).rounded())
+            let a = String(format: "%.3f", color.alpha * paintOpacity * node.effectiveOpacity)
+            fillStr = "rgba(\(r),\(g),\(bv),\(a))"
+        } else {
+            fillStr = "none"
+        }
+
+        // Build <path> elements. vectorPaths coordinates are in Figma canvas space,
+        // so translate by -x, -y to produce a 0-origin local SVG coordinate space.
+        var pathXml = ""
+        for vp in paths {
+            let rule = (vp.windingRule == "EVENODD") ? "evenodd" : "nonzero"
+            pathXml += "<path fill=\"\(fillStr)\" fill-rule=\"\(rule)\" d=\"\(vp.data)\" transform=\"translate(\(-b.x),\(-b.y))\"/>"
+        }
+        let svgContent = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"\(w)\" height=\"\(h)\" viewBox=\"0 0 \(w) \(h)\">\(pathXml)</svg>"
+
         let x: Int
         let y: Int
         if let p = parentBounds {
@@ -189,9 +214,10 @@ enum CanvasInstructionMapper {
         }
         return CanvasSvgIR(
             x: x, y: y,
-            width: Int(b.width.rounded()),
-            height: Int(b.height.rounded()),
-            svgId: svgId,
+            width: w,
+            height: h,
+            nodeId: node.id ?? node.name,
+            svgContent: svgContent,
             opacity: node.effectiveOpacity
         )
     }

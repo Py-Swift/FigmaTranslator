@@ -100,14 +100,16 @@ public struct CanvasImageIR {
 
 // MARK: - SVG IR
 
-/// Intermediate representation of a Figma VECTOR node exported as SVG.
+/// Intermediate representation of a Figma VECTOR node as an SVG.
 public struct CanvasSvgIR {
     public let x: Int
     public let y: Int
     public let width: Int
     public let height: Int
-    /// The Figma node ID used to fetch the SVG from FIGMA_SERVER_URL/svg/:id.
-    public let svgId: String
+    /// Figma node ID — used only to derive the Python constant name (e.g. "0:123" → SVG_0_123).
+    public let nodeId: String
+    /// Full SVG XML string, constructed from the node's `vectorPaths` and `fills`.
+    public let svgContent: String
     /// Node-level opacity.
     public let opacity: Double
 }
