@@ -14,6 +14,11 @@ public enum CanvasDesigner {
         return CanvasCodeGen.generate(frames: frames, scalable: scalable, smooth: smooth)
     }
 
+    /// Generate Python source code from pre-mapped canvas frames.
+    public static func generate(frames: [CanvasFrameIR], scalable: Bool = false, smooth: SmoothOptions = .init()) -> String {
+        CanvasCodeGen.generate(frames: frames, scalable: scalable, smooth: smooth)
+    }
+
     /// Parse JSON, then generate Python source code.
     public static func generate(json: String, scalable: Bool = false, smooth: SmoothOptions = .init()) throws -> String {
         let data = Data(json.utf8)
@@ -24,5 +29,11 @@ public enum CanvasDesigner {
     /// Map nodes to canvas IR without generating code — for use by `KivyWidgetDesigner`.
     public static func mapToIR(nodes: [FigmaNode]) -> [CanvasFrameIR] {
         CanvasInstructionMapper.map(nodes: nodes)
+    }
+
+    /// Returns all SVG IRs (nodeId + built SVG XML) found across a set of mapped frames.
+    /// Route handlers call this to pre-populate the server's SVG store before generating code.
+    public static func extractSvgs(frames: [CanvasFrameIR]) -> [(nodeId: String, svgContent: String)] {
+        CanvasCodeGen.extractSvgs(frames: frames)
     }
 }

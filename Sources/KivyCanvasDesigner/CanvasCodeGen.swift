@@ -48,7 +48,7 @@ public enum CanvasCodeGen {
         var needsText             = false
         var fontFamilies: [String] = []   // ordered, deduplicated in insertion order
         var imageRefs:    [String] = []   // ordered, deduplicated image hashes
-        var svgInfos: [(nodeId: String, svgContent: String)] = []   // ordered, deduplicated
+        var svgNodeIds: [String] = []   // ordered, deduplicated SVG node IDs
         func scanItems(_ items: [CanvasItem]) {
             for item in items {
                 switch item {
@@ -75,8 +75,8 @@ public enum CanvasCodeGen {
                     }
                 case .svg(let svg):
                     needsRectangle = true  // Svg extends Rectangle; Rectangle import is needed
-                    if !svgInfos.contains(where: { $0.nodeId == svg.nodeId }) {
-                        svgInfos.append((svg.nodeId, svg.svgContent))
+                    if !svgNodeIds.contains(svg.nodeId) {
+                        svgNodeIds.append(svg.nodeId)
                     }
                 }
             }
@@ -121,8 +121,8 @@ public enum CanvasCodeGen {
         if !imageRefs.isEmpty {
             body.append(contentsOf: imageRegistrationStmts(refs: imageRefs))
         }
-        if !svgInfos.isEmpty {
-            body.append(contentsOf: svgRegistrationStmts(infos: svgInfos))
+        if !svgNodeIds.isEmpty {
+            body.append(contentsOf: svgRegistrationStmts(ids: svgNodeIds))
             body.append(contentsOf: svgClassStmts())
         }
         for group in groups {
@@ -1124,6 +1124,28 @@ public enum CanvasCodeGen {
         return stmts
     }
 
+    // MARK: - Public SVG extraction
+
+    /// Returns all SVG node IDs and their built SVG XML strings from a set of frames.
+    /// Call this before `generate()` in the route handler to pre-populate the SVG store.
+    public static func extractSvgs(frames: [CanvasFrameIR]) -> [(nodeId: String, svgContent: String)] {
+        var results: [(nodeId: String, svgContent: String)] = []
+        func scan(_ items: [CanvasItem]) {
+            for item in items {
+                switch item {
+                case .svg(let svg) where !results.contains(where: { $0.nodeId == svg.nodeId }):
+                    results.append((svg.nodeId, svg.svgContent))
+                case .group(let g): scan(g.items)
+                default: break
+                }
+            }
+        }
+        for frame in frames { for layer in frame.layers { scan(layer.items) } }
+        return results
+    }
+
+    // MARK: - SVG constants helpers
+
     /// Converts a Figma node ID to a Python module-level constant name.
     /// e.g. "0:123" → "SVG_0_123"
     static func svgConstName(_ svgId: String) -> String {
@@ -1134,16 +1156,20 @@ public enum CanvasCodeGen {
         return "SVG_\(safe.uppercased())"
     }
 
-    /// Emits module-level statements that embed each SVG string and write it to a temp file,
-    /// binding a path constant for use by the `Svg` widget, e.g.:
-    ///   _SVG_DATA_SVG_0_123 = '<svg ...>...</svg>'
+    /// Percent-encodes a Figma node ID for use in a URL path (e.g. "0:123" → "0%3A123").
+    private static func svgIdUrlPath(_ svgId: String) -> String {
+        svgId.replacingOccurrences(of: ":", with: "%3A")
+    }
+
+    /// Emits module-level statements that fetch each SVG from FIGMA_SERVER_URL
+    /// into a temp file and bind a constant to its path, e.g.:
     ///   SVG_0_123 = _os.path.join(_tempfile.gettempdir(), "svgs", "svg_0_123.svg")
     ///   if not _os.path.exists(SVG_0_123):
-    ///       with open(SVG_0_123, 'w') as _f:
-    ///           _f.write(_SVG_DATA_SVG_0_123)
-    private static func svgRegistrationStmts(infos: [(nodeId: String, svgContent: String)]) -> [Statement] {
-        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",       asName: "_os")]))
-        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile", asName: "_tempfile")]))
+    ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/svg/0%3A123", SVG_0_123)
+    private static func svgRegistrationStmts(ids: [String]) -> [Statement] {
+        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
+        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",             asName: "_os")]))
+        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",       asName: "_tempfile")]))
 
         // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "svgs"), exist_ok=True)
         let svgsDirExpr = callExpr(
@@ -1160,19 +1186,12 @@ public enum CanvasCodeGen {
             keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
         ))
 
-        var stmts: [Statement] = [.blank(), importOs, importTempfile, .blank(), makedirs]
+        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
 
-        for (nodeId, svgContent) in infos {
-            let constName     = svgConstName(nodeId)
-            let dataConstName = "_SVG_DATA_\(constName)"
-            let fileBasename  = constName.lowercased() + ".svg"
-
-            // _SVG_DATA_SVG_0_123 = '<svg ...>...'
-            let dataAssign = Statement.assign(Assign(
-                targets: [.name(Name(id: dataConstName, ctx: .store))],
-                value: strConst(svgContent),
-                typeComment: nil
-            ))
+        for nodeId in ids {
+            let constName    = svgConstName(nodeId)
+            let fileBasename = constName.lowercased() + ".svg"
+            let idEncoded    = svgIdUrlPath(nodeId)
 
             // SVG_0_123 = _os.path.join(_tempfile.gettempdir(), "svgs", "svg_0_123.svg")
             let constAssign = Statement.assign(Assign(
@@ -1189,23 +1208,19 @@ public enum CanvasCodeGen {
                 typeComment: nil
             ))
 
-            // with open(SVG_0_123, 'w') as _f:
-            //     _f.write(_SVG_DATA_SVG_0_123)
-            let writeStmt = Statement.withStmt(With(
-                items: [WithItem(
-                    contextExpr: callExpr(
-                        fun: nameExpr("open"),
-                        args: [nameExpr(constName), strConst("w")],
-                        keywords: []
-                    ),
-                    optionalVars: .name(Name(id: "_f", ctx: .store))
-                )],
-                body: [exprStmt(callExpr(
-                    fun: attrExpr(nameExpr("_f"), "write"),
-                    args: [nameExpr(dataConstName)],
-                    keywords: []
-                ))],
-                typeComment: nil
+            // _os.environ["FIGMA_SERVER_URL"] + "/svg/0%3A123"
+            let serverUrl = Expression.subscriptExpr(Subscript(
+                value: attrExpr(nameExpr("_os"), "environ"),
+                slice: strConst("FIGMA_SERVER_URL")
+            ))
+            let downloadUrl = Expression.binOp(BinOp(
+                left: serverUrl, op: .add, right: strConst("/svg/\(idEncoded)")
+            ))
+
+            let urlretrieve = exprStmt(callExpr(
+                fun: attrExpr(nameExpr("_urllib_request"), "urlretrieve"),
+                args: [downloadUrl, nameExpr(constName)],
+                keywords: []
             ))
 
             let ifNotExists = Statement.ifStmt(If(
@@ -1213,12 +1228,11 @@ public enum CanvasCodeGen {
                     fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "exists"),
                     args: [nameExpr(constName)], keywords: []
                 ))),
-                body: [writeStmt],
+                body: [urlretrieve],
                 orElse: []
             ))
 
             stmts.append(.blank())
-            stmts.append(dataAssign)
             stmts.append(constAssign)
             stmts.append(ifNotExists)
         }
