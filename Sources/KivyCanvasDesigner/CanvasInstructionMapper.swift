@@ -12,14 +12,15 @@ enum CanvasInstructionMapper {
     /// A top-level CANVAS/PAGE node is unwrapped one level so its children are processed.
     static func map(nodes: [FigmaNode]) -> [CanvasFrameIR] {
         var result: [CanvasFrameIR] = []
+        var usedNames: [String: Int] = [:]
         for node in nodes {
             switch node.type {
             case .canvas, .page:
                 for child in node.children ?? [] {
-                    if let ir = frameToIR(child) { result.append(ir) }
+                    if let ir = frameToIR(child, usedNames: &usedNames) { result.append(ir) }
                 }
             default:
-                if let ir = frameToIR(node) { result.append(ir) }
+                if let ir = frameToIR(node, usedNames: &usedNames) { result.append(ir) }
             }
         }
         return result
@@ -27,7 +28,7 @@ enum CanvasInstructionMapper {
 
     // MARK: - Frame → IR
 
-    private static func frameToIR(_ node: FigmaNode) -> CanvasFrameIR? {
+    private static func frameToIR(_ node: FigmaNode, usedNames: inout [String: Int]) -> CanvasFrameIR? {
         // Accept frames/components/instances as normal containers.
         // Also accept groups if they are themselves named as a canvas layer
         // (i.e. the user locked/sent <canvas> directly).
@@ -45,7 +46,7 @@ enum CanvasInstructionMapper {
         let b = node.absoluteBoundingBox
         let w = Int((b?.width ?? 0).rounded())
         let h = Int((b?.height ?? 0).rounded())
-        let layers = canvasLayersFor(node, parentBounds: b)
+        let layers = canvasLayersFor(node, parentBounds: b, usedNames: &usedNames)
         return CanvasFrameIR(className: className, width: w, height: h, layers: layers)
     }
 
@@ -82,20 +83,22 @@ enum CanvasInstructionMapper {
     /// - No sentinel found → returns an empty array (no canvas for this frame).
     private static func canvasLayersFor(
         _ node: FigmaNode,
-        parentBounds: FigmaBounds?
+        parentBounds: FigmaBounds?,
+        usedNames: inout [String: Int]
     ) -> [CanvasLayerIR] {
         // Case 1: the node itself is a canvas sentinel (user locked/sent it directly).
         if let target = canvasTarget(for: node.name) {
-            let items = collectItems(node.children ?? [], parentBounds: parentBounds)
+            let items = collectItems(node.children ?? [], parentBounds: parentBounds, usedNames: &usedNames)
             return [CanvasLayerIR(target: target, items: items)]
         }
 
         // Case 2: look for named canvas children — only items inside those groups count.
         // The <canvas>/<canvas.before>/<canvas.after> labels are required; no sentinel = no canvas.
-        let namedLayers: [CanvasLayerIR] = (node.children ?? []).compactMap { child in
-            guard let target = canvasTarget(for: child.name) else { return nil }
-            let items = collectItems(child.children ?? [], parentBounds: parentBounds)
-            return CanvasLayerIR(target: target, items: items)
+        var namedLayers: [CanvasLayerIR] = []
+        for child in node.children ?? [] {
+            guard let target = canvasTarget(for: child.name) else { continue }
+            let items = collectItems(child.children ?? [], parentBounds: parentBounds, usedNames: &usedNames)
+            namedLayers.append(CanvasLayerIR(target: target, items: items))
         }
         return namedLayers
     }
@@ -104,7 +107,8 @@ enum CanvasInstructionMapper {
 
     private static func collectItems(
         _ children: [FigmaNode],
-        parentBounds: FigmaBounds?
+        parentBounds: FigmaBounds?,
+        usedNames: inout [String: Int]
     ) -> [CanvasItem] {
         var items: [CanvasItem] = []
         for child in children {
@@ -146,13 +150,17 @@ enum CanvasInstructionMapper {
             case .group:
                 if canvasTarget(for: child.name) != nil {
                     // Canvas sentinel: inline its children rather than creating a group.
-                    items.append(contentsOf: collectItems(child.children ?? [], parentBounds: parentBounds))
+                    items.append(contentsOf: collectItems(child.children ?? [], parentBounds: parentBounds, usedNames: &usedNames))
                 } else {
                     // Named Figma GROUP → InstructionGroup subclass.
-                    let groupItems = collectItems(child.children ?? [], parentBounds: parentBounds)
+                    let baseName = sanitiseName(child.name)
+                    let count = usedNames[baseName, default: 0]
+                    usedNames[baseName] = count + 1
+                    let className = count == 0 ? baseName : "\(baseName)_\(count + 1)"
+                    let groupItems = collectItems(child.children ?? [], parentBounds: parentBounds, usedNames: &usedNames)
                     if !groupItems.isEmpty {
                         items.append(.group(CanvasGroupIR(
-                            className: sanitiseName(child.name),
+                            className: className,
                             items: groupItems,
                             frameWidth:  Int((parentBounds?.width  ?? 0).rounded()),
                             frameHeight: Int((parentBounds?.height ?? 0).rounded())
@@ -162,10 +170,14 @@ enum CanvasInstructionMapper {
             case .frame, .instance, .component:
                 // Per spec: any frame/component inside a <canvas> group is a new class container.
                 // Treat the same as a named group — emit an InstructionGroup subclass.
-                let containerItems = collectItems(child.children ?? [], parentBounds: parentBounds)
+                let baseName = sanitiseName(child.name)
+                let count = usedNames[baseName, default: 0]
+                usedNames[baseName] = count + 1
+                let className = count == 0 ? baseName : "\(baseName)_\(count + 1)"
+                let containerItems = collectItems(child.children ?? [], parentBounds: parentBounds, usedNames: &usedNames)
                 if !containerItems.isEmpty {
                     items.append(.group(CanvasGroupIR(
-                        className: sanitiseName(child.name),
+                        className: className,
                         items: containerItems,
                         frameWidth:  Int((parentBounds?.width  ?? 0).rounded()),
                         frameHeight: Int((parentBounds?.height ?? 0).rounded())
