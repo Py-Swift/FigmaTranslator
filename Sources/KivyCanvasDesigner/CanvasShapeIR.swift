@@ -56,7 +56,6 @@ public struct CanvasShapeIR {
 public enum CanvasTarget {
     case before   // self.canvas.before  (default)
     case after    // self.canvas.after
-    case main     // self.canvas
 }
 
 // MARK: - Text IR

@@ -122,7 +122,7 @@ enum WidgetInstructionMapper {
 
     static func isCanvasSentinel(_ name: String) -> Bool {
         switch name.lowercased() {
-        case "<canvas>", "<canvas.before>", "<canvas.after>", "</canvas>", "<canvas.main>":
+        case "<canvas>", "<canvas.before>", "<canvas.after>", "</canvas>":
             return true
         default:
             return false

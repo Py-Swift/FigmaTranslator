@@ -58,15 +58,12 @@ enum CanvasInstructionMapper {
     ///   `<canvas.before>`   → .before
     ///   `<canvas.after>`    → .after
     ///   `</canvas>`         → .after
-    ///   `<canvas.main>`     → .main
     private static func canvasTarget(for name: String) -> CanvasTarget? {
         switch name.lowercased() {
         case "<canvas>", "<canvas.before>":
             return .before
         case "<canvas.after>", "</canvas>":
             return .after
-        case "<canvas.main>":
-            return .main
         default:
             return nil
         }

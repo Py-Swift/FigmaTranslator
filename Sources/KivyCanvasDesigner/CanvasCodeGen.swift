@@ -244,12 +244,11 @@ public enum CanvasCodeGen {
         for (i, layer) in activeLayers.enumerated() {
             if i > 0 { stmts.append(.blank()) }
 
-            // cb = self.canvas.before / after / (main)
+            // cb = self.canvas.before / after
             let cbExpr: Expression
             switch layer.target {
             case .before: cbExpr = attrExpr(attrExpr(nameExpr("self"), "canvas"), "before")
             case .after:  cbExpr = attrExpr(attrExpr(nameExpr("self"), "canvas"), "after")
-            case .main:   cbExpr = attrExpr(nameExpr("self"), "canvas")
             }
             stmts.append(.assign(Assign(
                 targets: [.name(Name(id: "cb", ctx: .store))],
