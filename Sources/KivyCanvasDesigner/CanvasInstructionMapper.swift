@@ -278,7 +278,7 @@ enum CanvasInstructionMapper {
         cornerRadii: [Double]?,
         parentBounds: FigmaBounds?
     ) -> CanvasShapeIR? {
-        guard let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) else { return nil }
+        guard let (color, paintOpacity) = anyColorAndOpacity(from: node.fills) else { return nil }
         // Polygons: absoluteBoundingBox covers the full square tile; absoluteRenderBounds
         // tightly wraps the actual shape, giving correct position and height.
         let b: FigmaBounds
@@ -557,6 +557,31 @@ enum CanvasInstructionMapper {
         guard let paint = fills?.first(where: { $0.type == .solid && $0.visible != false }),
               let color = paint.color else { return nil }
         return (color, paint.effectiveOpacity)
+    }
+
+    /// Returns a best-effort (color, paintOpacity) for any visible non-image fill.
+    /// Solid fills are returned as-is; gradient fills are approximated by averaging stops.
+    private static func anyColorAndOpacity(from fills: [FigmaPaint]?) -> (FigmaColor, Double)? {
+        guard let paint = fills?.first(where: {
+            $0.visible != false &&
+            $0.type != .image && $0.type != .pattern &&
+            $0.type != .emoji && $0.type != .video
+        }) else { return nil }
+        switch paint.type {
+        case .solid:
+            guard let color = paint.color else { return nil }
+            return (color, paint.effectiveOpacity)
+        case .gradientLinear, .gradientRadial, .gradientAngular, .gradientDiamond:
+            guard let stops = paint.gradientStops, !stops.isEmpty else { return nil }
+            let n = Double(stops.count)
+            let r = stops.reduce(0.0) { $0 + $1.color.r } / n
+            let g = stops.reduce(0.0) { $0 + $1.color.g } / n
+            let b = stops.reduce(0.0) { $0 + $1.color.b } / n
+            let a = stops.reduce(0.0) { $0 + $1.color.alpha } / n
+            return (FigmaColor(r: r, g: g, b: b, a: a), paint.effectiveOpacity)
+        default:
+            return nil
+        }
     }
 
     private static func imageRefAndOpacity(from fills: [FigmaPaint]?) -> (String, Double)? {
