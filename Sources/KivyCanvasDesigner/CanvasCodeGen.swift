@@ -114,6 +114,10 @@ public enum CanvasCodeGen {
         // Assemble module body: imports → font/image/svg registration → group classes → frame Widget classes.
         var body: [Statement] = needsText ? [importWidget, importGraphics, importCoreLabel]
                                           : [importWidget, importGraphics]
+        let needsDownload = !fontFamilies.isEmpty || !imageRefs.isEmpty || !svgNodeIds.isEmpty
+        if needsDownload {
+            body.append(contentsOf: downloadImports())
+        }
         if !fontFamilies.isEmpty {
             body.append(contentsOf: fontRegistrationStmts(families: fontFamilies))
         }
@@ -1046,16 +1050,20 @@ public enum CanvasCodeGen {
         return "IMG_\(prefix)"
     }
 
+    /// Shared download-utility imports emitted once when any of font/image/svg registration is needed.
+    private static func downloadImports() -> [Statement] {
+        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
+        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",              asName: "_os")]))
+        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",        asName: "_tempfile")]))
+        return [.blank(), importUrllib, importOs, importTempfile]
+    }
+
     /// Emits module-level statements that download each image from FIGMA_SERVER_URL
     /// into a temp file and bind a constant to its path, e.g.:
     ///   IMG_72963454773DC84B = _os.path.join(_tempfile.gettempdir(), "images", "72963454773dc84b.png")
     ///   if not _os.path.exists(IMG_72963454773DC84B):
     ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/image/HASH", IMG_72963454773DC84B)
     private static func imageRegistrationStmts(refs: [String]) -> [Statement] {
-        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
-        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",              asName: "_os")]))
-        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",        asName: "_tempfile")]))
-
         // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "images"), exist_ok=True)
         let fontsDirExpr = callExpr(
             fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
@@ -1071,7 +1079,7 @@ public enum CanvasCodeGen {
             keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
         ))
 
-        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+        var stmts: [Statement] = [.blank(), makedirs]
 
         for ref in refs {
             let constName    = imageConstName(ref)
@@ -1166,10 +1174,6 @@ public enum CanvasCodeGen {
     ///   if not _os.path.exists(SVG_0_123):
     ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/svg/0%3A123", SVG_0_123)
     private static func svgRegistrationStmts(ids: [String]) -> [Statement] {
-        let importUrllib   = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
-        let importOs       = Statement.importStmt(Import(names: [Alias(name: "os",             asName: "_os")]))
-        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",       asName: "_tempfile")]))
-
         // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "svgs"), exist_ok=True)
         let svgsDirExpr = callExpr(
             fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
@@ -1185,7 +1189,7 @@ public enum CanvasCodeGen {
             keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
         ))
 
-        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+        var stmts: [Statement] = [.blank(), makedirs]
 
         for nodeId in ids {
             let constName    = svgConstName(nodeId)
@@ -1254,10 +1258,6 @@ public enum CanvasCodeGen {
     ///   if not _os.path.exists(COMIC_SANS_MS):
     ///       _urllib_request.urlretrieve(_os.environ["FIGMA_SERVER_URL"] + "/font/Comic%20Sans%20MS", COMIC_SANS_MS)
     private static func fontRegistrationStmts(families: [String]) -> [Statement] {
-        let importUrllib  = Statement.importStmt(Import(names: [Alias(name: "urllib.request", asName: "_urllib_request")]))
-        let importOs      = Statement.importStmt(Import(names: [Alias(name: "os",              asName: "_os")]))
-        let importTempfile = Statement.importStmt(Import(names: [Alias(name: "tempfile",       asName: "_tempfile")]))
-
         // _os.makedirs(_os.path.join(_tempfile.gettempdir(), "fonts"), exist_ok=True)
         let fontsDirExpr = callExpr(
             fun: attrExpr(attrExpr(nameExpr("_os"), "path"), "join"),
@@ -1273,7 +1273,7 @@ public enum CanvasCodeGen {
             keywords: [Keyword(arg: "exist_ok", value: boolConst(true))]
         ))
 
-        var stmts: [Statement] = [.blank(), importUrllib, importOs, importTempfile, .blank(), makedirs]
+        var stmts: [Statement] = [.blank(), makedirs]
 
         for family in families {
             let constName    = fontConstName(family)
