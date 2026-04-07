@@ -56,5 +56,17 @@ let package = Package(
                 .swiftLanguageMode(.v5),
             ]
         ),
+        .testTarget(
+            name: "KivyCanvasDesignerTests",
+            dependencies: [
+                .target(name: "KivyCanvasDesigner"),
+            ],
+            resources: [
+                .copy("test_design_0.json"),
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
+        ),
     ]
 )

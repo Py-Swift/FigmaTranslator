@@ -116,15 +116,20 @@ enum CanvasInstructionMapper {
             }
             switch child.type {
             case .rectangle, .vector:
-                // VECTOR nodes with vectorPaths are exported as SVG; fall back to solid-fill rectangle.
-                if child.type == .vector, let ir = svgToIR(child, parentBounds: parentBounds) {
-                    items.append(.svg(ir))
-                } else {
-                    let radii = cornerRadii(for: child)
-                    let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
-                    if let ir = shapeToIR(child, kind: kind, cornerRadii: radii, parentBounds: parentBounds) {
+                if child.type == .vector {
+                    if let ir = nativeVectorShapeToIR(child, parentBounds: parentBounds) {
                         items.append(.shape(ir))
+                        continue
                     }
+                    if let ir = svgToIR(child, parentBounds: parentBounds) {
+                        items.append(.svg(ir))
+                        continue
+                    }
+                }
+                let radii = cornerRadii(for: child)
+                let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
+                if let ir = shapeToIR(child, kind: kind, cornerRadii: radii, parentBounds: parentBounds) {
+                    items.append(.shape(ir))
                 }
             case .ellipse:
                 if let ir = shapeToIR(child, kind: .ellipse, cornerRadii: nil, parentBounds: parentBounds) {
@@ -176,15 +181,13 @@ enum CanvasInstructionMapper {
     // MARK: - Single SVG → IR
 
     private static func svgToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasSvgIR? {
-        guard let paths = node.vectorPaths, !paths.isEmpty,
+        guard let paths = node.fillGeometry, !paths.isEmpty,
               let b = node.absoluteBoundingBox else { return nil }
 
         let w = Int(b.width.rounded())
         let h = Int(b.height.rounded())
 
-        // Derive fill colour: solid fill → solid stroke fallback → black default.
-        // VECTOR nodes often have no fill (styled via stroke or inherited colour);
-        // using black ensures the shape is always visible in the preview.
+        // Derive node-level fill colour for fallback.
         func rgbaStr(_ color: FigmaColor, _ paintOpacity: Double) -> String {
             let r  = Int((color.r * 255).rounded())
             let g  = Int((color.g * 255).rounded())
@@ -192,32 +195,28 @@ enum CanvasInstructionMapper {
             let a  = String(format: "%.3f", color.alpha * paintOpacity * node.effectiveOpacity)
             return "rgba(\(r),\(g),\(bv),\(a))"
         }
-        let fillStr: String
+        let nodeFillStr: String
         var strokeStr = "none"
         var strokeWidth = 0.0
         if let (color, paintOpacity) = solidColorAndOpacity(from: node.fills) {
-            fillStr = rgbaStr(color, paintOpacity)
+            nodeFillStr = rgbaStr(color, paintOpacity)
         } else if let (color, paintOpacity) = solidColorAndOpacity(from: node.strokes) {
-            // No fill but has a stroke — render as a filled shape using the stroke colour.
-            fillStr = rgbaStr(color, paintOpacity)
+            nodeFillStr = rgbaStr(color, paintOpacity)
         } else {
-            // No colour info at all — fall back to black so the shape is visible.
-            fillStr = "#000000"
+            nodeFillStr = "#000000"
         }
-        // Also include stroke if both fill and stroke paints are present.
-        if fillStr != "none", let (sColor, sOpacity) = solidColorAndOpacity(from: node.strokes) {
+        if let (sColor, sOpacity) = solidColorAndOpacity(from: node.strokes) {
             strokeStr = rgbaStr(sColor, sOpacity)
             strokeWidth = node.strokeWeight ?? 1.0
         }
 
-        // Build <path> elements. vectorPaths from the Plugin API are already in node-local
-        // coordinate space, so no translate transform is needed.
+        // Build <path> elements using REST fillGeometry paths.
         var pathXml = ""
         for vp in paths {
             let rule = (vp.windingRule == "EVENODD") ? "evenodd" : "nonzero"
-            var attrs = "fill=\"\(fillStr)\" fill-rule=\"\(rule)\""
+            var attrs = "fill=\"\(nodeFillStr)\" fill-rule=\"\(rule)\""
             if strokeStr != "none" { attrs += " stroke=\"\(strokeStr)\" stroke-width=\"\(strokeWidth)\"" }
-            pathXml += "<path \(attrs) d=\"\(vp.data)\"/>"
+            pathXml += "<path \(attrs) d=\"\(vp.path)\"/>"
         }
         let svgContent = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"\(w)\" height=\"\(h)\" viewBox=\"0 0 \(w) \(h)\">\(pathXml)</svg>"
 
@@ -238,6 +237,26 @@ enum CanvasInstructionMapper {
             svgContent: svgContent,
             opacity: node.effectiveOpacity
         )
+    }
+
+    private static func nativeVectorShapeToIR(_ node: FigmaNode, parentBounds: FigmaBounds?) -> CanvasShapeIR? {
+        guard node.type == .vector,
+              !hasVisibleStroke(node),
+              let path = node.fillGeometry?.first,
+              node.fillGeometry?.count == 1,
+              let bounds = node.absoluteBoundingBox else { return nil }
+
+        if isAxisAlignedRectanglePath(path.path, width: bounds.width, height: bounds.height) {
+            let radii = cornerRadii(for: node)
+            let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
+            return shapeToIR(node, kind: kind, cornerRadii: radii, parentBounds: parentBounds)
+        }
+
+        if isSimpleEllipsePath(path.path, width: bounds.width, height: bounds.height) {
+            return shapeToIR(node, kind: .ellipse, cornerRadii: nil, parentBounds: parentBounds)
+        }
+
+        return nil
     }
 
     // MARK: - Single shape → IR
@@ -303,20 +322,20 @@ enum CanvasInstructionMapper {
         let w = Int(b.width.rounded())
         let h = Int(b.height.rounded())
 
-        // Font size: prefer Plugin API direct field, fall back to style, default 14
-        let rawSize = node.fontSize ?? node.style?.fontSize ?? 14
+        // Font size from style, default 14
+        let rawSize = node.style?.fontSize ?? 14
         let fontSize = max(1, Int(rawSize.rounded()))
 
-        // Bold / italic from fontName.style string (Plugin API) or FigmaTypeStyle
-        let styleStr = (node.fontName?.style ?? node.style?.fontStyle ?? "").lowercased()
-        let bold   = styleStr.contains("bold")
-        let italic = styleStr.contains("italic") || styleStr.contains("oblique")
+        // Bold / italic from FigmaTypeStyle
+        let styleStr = (node.style?.fontStyle ?? "").lowercased()
+        let bold   = styleStr.contains("bold") || node.style?.italic == true
+        let italic = styleStr.contains("italic") || styleStr.contains("oblique") || node.style?.italic == true
 
         // Font family
-        let fontFamily = node.fontName?.family ?? node.style?.fontFamily ?? ""
+        let fontFamily = node.style?.fontFamily ?? ""
 
         // Halign mapping from Figma → Kivy
-        let halignRaw = node.textAlignHorizontal ?? node.style?.textAlignHorizontal ?? "LEFT"
+        let halignRaw = node.style?.textAlignHorizontal ?? "LEFT"
         let halign: String
         switch halignRaw.uppercased() {
         case "CENTER":    halign = "center"
@@ -361,6 +380,164 @@ enum CanvasInstructionMapper {
             return nil
         }
         return radii.contains(where: { $0 > 0 }) ? radii : nil
+    }
+
+    private static func hasVisibleStroke(_ node: FigmaNode) -> Bool {
+        guard (node.strokeWeight ?? 0) > 0 else { return false }
+        return node.strokes?.contains(where: { $0.visible != false }) ?? false
+    }
+
+    private static func isAxisAlignedRectanglePath(_ data: String, width: Double, height: Double) -> Bool {
+        let commands = svgPathCommands(data)
+        guard !commands.isEmpty else { return false }
+
+        var points: [(Double, Double)] = []
+        for command in commands {
+            switch command.name {
+            case "M", "L":
+                guard command.values.count == 2 else { return false }
+                points.append((command.values[0], command.values[1]))
+            case "Z":
+                guard command.values.isEmpty else { return false }
+            default:
+                return false
+            }
+        }
+
+        guard points.count >= 4 else { return false }
+        if let first = points.first, let last = points.last, approxEqual(first.0, last.0, tolerance: rectangleTolerance(width: width, height: height)), approxEqual(first.1, last.1, tolerance: rectangleTolerance(width: width, height: height)) {
+            points.removeLast()
+        }
+        guard points.count == 4 else { return false }
+
+        let tolerance = rectangleTolerance(width: width, height: height)
+        let corners = [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
+        var matched = Array(repeating: false, count: corners.count)
+
+        for point in points {
+            guard let cornerIndex = corners.indices.first(where: { !matched[$0] && pointMatches(point, corners[$0], tolerance: tolerance) }) else {
+                return false
+            }
+            matched[cornerIndex] = true
+        }
+
+        for index in points.indices {
+            let next = points[(index + 1) % points.count]
+            let current = points[index]
+            let sameX = approxEqual(current.0, next.0, tolerance: tolerance)
+            let sameY = approxEqual(current.1, next.1, tolerance: tolerance)
+            if sameX == sameY { return false }
+        }
+        return true
+    }
+
+    private static func isSimpleEllipsePath(_ data: String, width: Double, height: Double) -> Bool {
+        let commands = svgPathCommands(data)
+        guard commands.count == 6,
+              commands.first?.name == "M",
+              commands.dropFirst().dropLast().allSatisfy({ $0.name == "C" && $0.values.count == 6 }),
+              commands.last?.name == "Z" else { return false }
+
+        let tolerance = rectangleTolerance(width: width, height: height)
+        var endpoints: [(Double, Double)] = []
+
+        if let move = commands.first?.values, move.count == 2 {
+            endpoints.append((move[0], move[1]))
+        } else {
+            return false
+        }
+
+        for command in commands.dropFirst().dropLast() {
+            endpoints.append((command.values[4], command.values[5]))
+        }
+
+        if let first = endpoints.first, let last = endpoints.last, pointMatches(first, last, tolerance: tolerance) {
+            endpoints.removeLast()
+        }
+
+        guard endpoints.count == 4 else { return false }
+
+        let cardinalPoints = [
+            (0.0, height / 2),
+            (width / 2, 0.0),
+            (width, height / 2),
+            (width / 2, height)
+        ]
+        var matched = Array(repeating: false, count: cardinalPoints.count)
+
+        for point in endpoints {
+            guard let pointIndex = cardinalPoints.indices.first(where: { !matched[$0] && pointMatches(point, cardinalPoints[$0], tolerance: tolerance) }) else {
+                return false
+            }
+            matched[pointIndex] = true
+        }
+        return true
+    }
+
+    private static func svgPathCommands(_ data: String) -> [(name: String, values: [Double])] {
+        guard let regex = try? NSRegularExpression(pattern: #"[A-Za-z]|[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?"#) else {
+            return []
+        }
+
+        let nsData = data as NSString
+        let rawTokens = regex.matches(in: data, range: NSRange(location: 0, length: nsData.length)).map {
+            nsData.substring(with: $0.range)
+        }
+
+        var commands: [(name: String, values: [Double])] = []
+        var index = 0
+        while index < rawTokens.count {
+            let token = rawTokens[index]
+            guard token.count == 1, let scalar = token.unicodeScalars.first, CharacterSet.letters.contains(scalar) else {
+                return []
+            }
+
+            let name = token.uppercased()
+            guard let arity = svgCommandArity(name) else { return [] }
+            index += 1
+
+            if arity == 0 {
+                commands.append((name, []))
+                continue
+            }
+
+            var values: [Double] = []
+            while index < rawTokens.count {
+                let next = rawTokens[index]
+                if next.count == 1, let scalar = next.unicodeScalars.first, CharacterSet.letters.contains(scalar) {
+                    break
+                }
+                guard let value = Double(next) else { return [] }
+                values.append(value)
+                index += 1
+            }
+
+            guard values.count == arity else { return [] }
+            commands.append((name, values))
+        }
+
+        return commands
+    }
+
+    private static func svgCommandArity(_ name: String) -> Int? {
+        switch name {
+        case "M", "L": return 2
+        case "C": return 6
+        case "Z": return 0
+        default: return nil
+        }
+    }
+
+    private static func rectangleTolerance(width: Double, height: Double) -> Double {
+        max(0.5, max(width, height) * 0.002)
+    }
+
+    private static func pointMatches(_ lhs: (Double, Double), _ rhs: (Double, Double), tolerance: Double) -> Bool {
+        approxEqual(lhs.0, rhs.0, tolerance: tolerance) && approxEqual(lhs.1, rhs.1, tolerance: tolerance)
+    }
+
+    private static func approxEqual(_ lhs: Double, _ rhs: Double, tolerance: Double) -> Bool {
+        abs(lhs - rhs) <= tolerance
     }
 
     // MARK: - Helpers

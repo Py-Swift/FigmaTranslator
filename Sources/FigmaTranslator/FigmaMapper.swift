@@ -730,30 +730,28 @@ public enum FigmaMapper {
         line += 1
         props.append(prop("text", "'\(text)'", line: line))
 
-        if let fs = node.fontSize {
+        if let fs = node.style?.fontSize {
             line += 1
             props.append(prop("font_size", "'\(Int(fs.rounded()))sp'", line: line))
         }
 
-        // fontName.family → font_name
-        // fontName.style → bold / italic  (e.g. "Bold", "Bold Italic", "Italic")
-        if let fontName = node.fontName {
-            if !fontName.family.isEmpty {
-                line += 1
-                props.append(prop("font_name", "'\(fontName.family)'", line: line))
-            }
-            let styleLC = fontName.style.lowercased()
+        if let family = node.style?.fontFamily, !family.isEmpty {
+            line += 1
+            props.append(prop("font_name", "'\(family)'", line: line))
+        }
+        let styleLC = (node.style?.fontStyle ?? "").lowercased()
+        if styleLC.contains("bold") || node.style?.italic == true {
             if styleLC.contains("bold") {
                 line += 1
                 props.append(prop("bold", "True", line: line))
             }
-            if styleLC.contains("italic") {
+            if styleLC.contains("italic") || node.style?.italic == true {
                 line += 1
                 props.append(prop("italic", "True", line: line))
             }
         }
 
-        if let halign = node.textAlignHorizontal {
+        if let halign = node.style?.textAlignHorizontal {
             let kvHalign: String?
             switch halign {
             case "LEFT":      kvHalign = "'left'"
@@ -768,7 +766,7 @@ public enum FigmaMapper {
             }
         }
 
-        if let valign = node.textAlignVertical {
+        if let valign = node.style?.textAlignVertical {
             let kvValign: String?
             switch valign {
             case "TOP":    kvValign = "'top'"
