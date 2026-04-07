@@ -129,6 +129,8 @@ enum CanvasInstructionMapper {
                         items.append(.svg(ir))
                         continue
                     }
+                    // No geometry data available (JSON_REST_V1 omits fillGeometry) — skip.
+                    continue
                 }
                 let radii = cornerRadii(for: child)
                 let kind: CanvasShapeKind = radii != nil ? .roundedRectangle : .rectangle
